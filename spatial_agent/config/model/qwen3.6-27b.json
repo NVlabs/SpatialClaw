@@ -1,0 +1,32 @@
+{
+    "llm_model": "qwen3.6-27b",
+    "llm_base_url": "vllm",
+    "llm_api_key": "bearer",
+    "roles": {
+        "main": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "enable_thinking": true
+        },
+        "planning": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "enable_thinking": true
+        },
+        "general": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "enable_thinking": true
+        },
+        "vlm": {
+            "max_tokens": 32768,
+            "temperature": 0.6,
+            "enable_thinking": true
+        },
+        "vlm_grounding": {
+            "max_tokens": 16384,
+            "temperature": 0.6,
+            "enable_thinking": true
+        }
+    }
+}

@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""
+SLURM CoT Baseline Runner with Automatic 4-Hour Restarts
+
+This script runs OUTSIDE SLURM and manages a continuous chain of 4-hour SLURM
+jobs for CoT baseline benchmark evaluations with automatic resume.
+
+No GPUs are requested — all VLM inference goes through the vLLM server.
+
+Usage:
+    python spatial_agent/scripts/cot_baseline/manager.py --benchmark erqa
+"""
+
+import argparse
+import datetime
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from termcolor import colored
+
+
+class SlurmCoTManager:
+    def __init__(
+        self,
+        benchmark: str,
+        job_name: str = "cot-baseline",
+        account: str = "nvr_lpr_nvgptvision",
+        partition: str = "cpu_interactive,cpu_short,cpu",
+        gpus: int = 0,
+        time_limit: str = "4:00:00",
+        concurrency: int = 32,
+        max_frames: int = 8,
+        run_script: str = "spatial_agent/scripts/cot_baseline/run.sh",
+        output_dir: str = None,
+        model_config: str = "",
+        subsample: int = 0,
+    ):
+        self.benchmark = benchmark
+        self.job_name = job_name
+        self.account = account
+        self.partition = partition
+        self.gpus = gpus
+        self.time_limit = time_limit
+        self.concurrency = concurrency
+        self.max_frames = max_frames
+        self.model_config = model_config
+        self.subsample = subsample
+
+        # Project root: go up 4 levels (cot_baseline -> scripts -> spatial_agent -> project)
+        self.project_root = Path(__file__).parent.parent.parent.parent.absolute()
+        self.run_script_path = self.project_root / run_script
+
+        if not self.run_script_path.exists():
+            raise FileNotFoundError(f"Run script not found: {self.run_script_path}")
+
+        if output_dir is None:
+            self.output_dir = self.project_root / "spatial_agent" / "logs" / "slurm_cot"
+        else:
+            self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.total_seconds = self._parse_time_to_seconds(time_limit)
+        self.running = True
+        self.job_counter = 1
+        self.current_job_id = None
+        self.submitted_job_ids = []
+
+        print(colored("=" * 60, "cyan"))
+        print(colored("SLURM CoT Baseline Chain Manager", "cyan", attrs=["bold"]))
+        print(colored("=" * 60, "cyan"))
+        print(f"Benchmark:         {self.benchmark}")
+        print(f"Job name:          {self.job_name}")
+        print(f"Account:           {self.account}")
+        print(f"Partition:         {self.partition}")
+        print(f"GPUs:              {self.gpus}")
+        print(f"Time limit:        {self.time_limit} ({self.total_seconds}s)")
+        print(f"Concurrency:       {self.concurrency}")
+        print(f"Max frames:        {self.max_frames}")
+        print(f"Subsample:         {self.subsample or '<all>'}")
+        print(f"Model config:      {self.model_config or '<none>'}")
+        print(f"Run script:        {self.run_script_path}")
+        print(f"Output directory:  {self.output_dir}")
+        print(colored("=" * 60, "cyan"))
+        print()
+
+    def _parse_time_to_seconds(self, time_str: str) -> int:
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            hours, minutes, seconds = map(int, parts)
+        elif len(parts) == 2:
+            hours = 0
+            minutes, seconds = map(int, parts)
+        else:
+            raise ValueError(f"Invalid time format: {time_str}")
+        return hours * 3600 + minutes * 60 + seconds
+
+    def _check_slurm_available(self) -> bool:
+        result = subprocess.run("which sbatch", shell=True, capture_output=True)
+        return result.returncode == 0
+
+    def _get_job_status(self, job_id: str) -> str:
+        if not job_id:
+            return "UNKNOWN"
+        cmd = ["squeue", "-j", str(job_id), "-h", "-o", "%T"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return "NOT_FOUND"
+        return result.stdout.strip().upper()
+
+    def _is_job_running(self, job_id: str) -> bool:
+        status = self._get_job_status(job_id)
+        return status in ["RUNNING", "PENDING", "CONFIGURING", "COMPLETING"]
+
+    def _wait_for_job_to_start(self, job_id: str, timeout: int = 7200) -> bool:
+        print(colored(
+            f"[{self._ts()}] Waiting for job {job_id} to start running...", "cyan"
+        ), flush=True)
+
+        start_time = time.time()
+        last_status = None
+        last_update_time = start_time
+
+        while self.running:
+            status = self._get_job_status(job_id)
+            current_time = time.time()
+
+            if status != last_status:
+                elapsed = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} status: {status} (waited {elapsed}m)", "cyan"
+                ), flush=True)
+                last_status = status
+                last_update_time = current_time
+
+            if status in ["PENDING", "CONFIGURING"] and current_time - last_update_time >= 300:
+                elapsed = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Still waiting for job {job_id}... ({elapsed}m elapsed)", "cyan"
+                ), flush=True)
+                last_update_time = current_time
+
+            if status == "RUNNING":
+                elapsed = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} is now running! (waited {elapsed}m)", "green"
+                ), flush=True)
+                return True
+            elif status in ["FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL", "PREEMPTED"]:
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} failed with status: {status}", "red"
+                ), flush=True)
+                return False
+            elif status == "NOT_FOUND":
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} not found in queue", "red"
+                ), flush=True)
+                return False
+            else:
+                time.sleep(5)
+
+        return False
+
+    def _wait_for_job_completion(self, job_id: str) -> bool:
+        print(colored(
+            f"[{self._ts()}] Waiting for job {job_id} to complete...", "cyan"
+        ), flush=True)
+
+        start_time = time.time()
+        last_update_time = start_time
+        check_interval = 60
+
+        while self.running:
+            status = self._get_job_status(job_id)
+            current_time = time.time()
+
+            if current_time - last_update_time >= 600:
+                elapsed_minutes = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} still running... ({elapsed_minutes}m elapsed)",
+                    "cyan"
+                ), flush=True)
+                last_update_time = current_time
+
+            if status == "RUNNING":
+                time.sleep(check_interval)
+                continue
+            elif status == "COMPLETED":
+                elapsed_minutes = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} completed! (ran for {elapsed_minutes}m)", "green"
+                ), flush=True)
+                return True
+            elif status in ["FAILED", "TIMEOUT", "NODE_FAIL", "CANCELLED"]:
+                elapsed_minutes = int((current_time - start_time) / 60)
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} ended with status: {status} (after {elapsed_minutes}m)",
+                    "red"
+                ), flush=True)
+                return False
+            elif status == "NOT_FOUND":
+                print(colored(
+                    f"[{self._ts()}] Job {job_id} not in queue, checking sacct...", "yellow"
+                ), flush=True)
+                cmd = ["sacct", "-j", str(job_id), "-n", "-o", "State"]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    sacct_status = result.stdout.strip().split()[0].upper()
+                    if "COMPLETED" in sacct_status:
+                        elapsed_minutes = int((current_time - start_time) / 60)
+                        print(colored(
+                            f"[{self._ts()}] Job {job_id} completed (via sacct, ran for {elapsed_minutes}m)",
+                            "green"
+                        ), flush=True)
+                        return True
+                    else:
+                        print(colored(
+                            f"[{self._ts()}] Job {job_id} ended with: {sacct_status}", "red"
+                        ), flush=True)
+                        return False
+                else:
+                    print(colored(
+                        f"[{self._ts()}] Cannot determine job status, assuming completed", "yellow"
+                    ), flush=True)
+                    return True
+            else:
+                time.sleep(check_interval)
+
+        return False
+
+    def _ts(self) -> str:
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _generate_slurm_script(self, job_number: int) -> str:
+        gpu_line = f"#SBATCH --gpus-per-node={self.gpus}" if self.gpus > 0 else ""
+        mem_gb = min(max(self.concurrency, 8), 32)
+        cpus = min(max(self.concurrency // 4, 4), 16)
+
+        script = f"""#!/bin/bash
+#SBATCH --job-name={self.job_name}
+#SBATCH --account={self.account}
+#SBATCH --partition={self.partition}
+#SBATCH --nodes=1
+{gpu_line}
+#SBATCH --mem={mem_gb}G
+#SBATCH --cpus-per-task={cpus}
+#SBATCH --time={self.time_limit}
+#SBATCH --output={self.output_dir}/{self.job_name}_%j.out
+#SBATCH --error={self.output_dir}/{self.job_name}_%j.err
+
+echo "=========================================="
+echo "SLURM CoT Baseline Evaluation - Job #{job_number}"
+echo "=========================================="
+echo "SLURM Job ID: $SLURM_JOB_ID"
+echo "Node: $SLURM_NODELIST"
+echo "Benchmark: {self.benchmark}"
+echo "Concurrency: {self.concurrency}"
+echo "Max Frames: {self.max_frames}"
+echo "Start time: $(date)"
+echo "=========================================="
+echo ""
+
+# Navigate to project root
+cd {self.project_root}
+
+# Activate conda environment
+CONDA_BASE="$(conda info --base 2>/dev/null)"
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate spatialagent
+
+# Run the CoT baseline evaluation
+bash {self.run_script_path} "{self.benchmark}" {self.concurrency} \\
+    "{self.model_config}" {self.max_frames} {self.subsample}
+
+echo ""
+echo "=========================================="
+echo "End time: $(date)"
+echo "=========================================="
+"""
+        return script
+
+    def submit_job(self) -> bool:
+        print(colored(f"[{self._ts()}] Submitting job #{self.job_counter}...", "cyan"), flush=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        script_path = self.output_dir / f"{self.job_name}_{timestamp}.sbatch"
+
+        script_content = self._generate_slurm_script(self.job_counter)
+        with open(script_path, "w") as f:
+            f.write(script_content)
+        script_path.chmod(0o755)
+
+        cmd = ["sbatch", str(script_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            job_id = None
+            for word in result.stdout.split():
+                if word.isdigit():
+                    job_id = word
+                    break
+
+            self.current_job_id = job_id
+            self.submitted_job_ids.append(job_id)
+
+            print(colored(
+                f"[{self._ts()}] Job #{self.job_counter} submitted: SLURM job ID {job_id}", "green"
+            ), flush=True)
+            print(colored(
+                f"[{self._ts()}] Log: {self.output_dir}/{self.job_name}_{job_id}.out", "cyan"
+            ), flush=True)
+            return True
+        else:
+            print(colored(
+                f"[{self._ts()}] Failed to submit job #{self.job_counter}", "red"
+            ), flush=True)
+            print(result.stderr, flush=True)
+            return False
+
+    def handle_shutdown(self, signum, frame):
+        print(colored(
+            f"\n[{self._ts()}] Received shutdown signal. Stopping chain...", "yellow"
+        ), flush=True)
+
+        self.running = False
+
+        if self.submitted_job_ids:
+            print(colored(
+                f"[{self._ts()}] Cancelling {len(self.submitted_job_ids)} submitted job(s)...",
+                "yellow"
+            ), flush=True)
+            for job_id in self.submitted_job_ids:
+                try:
+                    result = subprocess.run(
+                        ["scancel", str(job_id)], capture_output=True, text=True
+                    )
+                    if result.returncode == 0:
+                        print(colored(f"[{self._ts()}] Cancelled job {job_id}", "green"), flush=True)
+                    elif "Invalid job id" not in result.stderr:
+                        print(colored(
+                            f"[{self._ts()}] Note: Job {job_id} - {result.stderr.strip()}", "yellow"
+                        ), flush=True)
+                except Exception as e:
+                    print(colored(
+                        f"[{self._ts()}] Warning: Failed to cancel job {job_id}: {e}", "yellow"
+                    ), flush=True)
+            print(colored(f"[{self._ts()}] All jobs cancelled.", "green"), flush=True)
+
+    def run(self):
+        if not self._check_slurm_available():
+            print(colored("ERROR: SLURM not available. Cannot submit jobs.", "red"))
+            sys.exit(1)
+
+        signal.signal(signal.SIGINT, self.handle_shutdown)
+        signal.signal(signal.SIGTERM, self.handle_shutdown)
+
+        print(colored(f"[{self._ts()}] Starting continuous CoT baseline chain...", "green", attrs=["bold"]), flush=True)
+        print(colored(f"[{self._ts()}] Press Ctrl+C to stop the chain", "cyan"), flush=True)
+        print()
+
+        while self.running:
+            if not self.submit_job():
+                print(colored(
+                    f"[{self._ts()}] Failed to submit job, retrying in 60 seconds...", "yellow"
+                ), flush=True)
+                time.sleep(60)
+                continue
+
+            if not self._wait_for_job_to_start(self.current_job_id):
+                print(colored(
+                    f"[{self._ts()}] Job failed to start, will retry...", "yellow"
+                ), flush=True)
+                try:
+                    subprocess.run(["scancel", str(self.current_job_id)], capture_output=True)
+                except Exception:
+                    pass
+                time.sleep(60)
+                continue
+
+            job_completed = self._wait_for_job_completion(self.current_job_id)
+
+            if not job_completed:
+                print(colored(
+                    f"[{self._ts()}] Job ended abnormally, will retry in 60 seconds...", "yellow"
+                ), flush=True)
+                time.sleep(60)
+
+            self.job_counter += 1
+
+            if self.running:
+                print(colored(
+                    f"[{self._ts()}] Job completed. Submitting next job to resume...", "green"
+                ), flush=True)
+                print()
+
+        print(colored(f"[{self._ts()}] Chain manager stopped.", "green", attrs=["bold"]), flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Manage CoT baseline evaluation with automatic SLURM restarts"
+    )
+    parser.add_argument("--benchmark", type=str, required=True)
+    parser.add_argument("--job-name", type=str, default="cot-baseline")
+    parser.add_argument("--account", type=str, default="nvr_lpr_nvgptvision")
+    parser.add_argument("--partition", type=str, default="cpu_interactive,cpu_short,cpu")
+    parser.add_argument("--gpus", type=int, default=0)
+    parser.add_argument("--time", type=str, default="4:00:00")
+    parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument("--max-frames", type=int, default=8)
+    parser.add_argument("--run-script", type=str, default="spatial_agent/scripts/cot_baseline/run.sh")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--model-config", type=str, default="",
+                        help="Path to model config JSON (e.g., spatial_agent/config/model/qwen3.5-2b.json)")
+    parser.add_argument("--subsample", type=int, default=0,
+                        help="Deterministically subsample N random samples (seed=42)")
+
+    args = parser.parse_args()
+
+    manager = SlurmCoTManager(
+        benchmark=args.benchmark,
+        job_name=args.job_name,
+        account=args.account,
+        partition=args.partition,
+        gpus=args.gpus,
+        time_limit=args.time,
+        concurrency=args.concurrency,
+        max_frames=args.max_frames,
+        run_script=args.run_script,
+        output_dir=args.output_dir,
+        model_config=args.model_config,
+        subsample=args.subsample,
+    )
+
+    manager.run()
+
+
+if __name__ == "__main__":
+    main()

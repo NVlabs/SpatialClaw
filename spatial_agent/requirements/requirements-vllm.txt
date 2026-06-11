@@ -1,0 +1,16 @@
+# Requirements for the vLLM server environment (uv-managed .venv)
+#
+# This environment runs inside SLURM GPU jobs and serves models via
+# the vLLM OpenAI-compatible API server.
+#
+# Install (nightly vLLM with CUDA 12.9 — required for Gemma4 support):
+#   uv venv .venv --python 3.11
+#   source .venv/bin/activate
+#   uv pip install -U vllm --pre \
+#     --extra-index-url https://wheels.vllm.ai/nightly/cu129 \
+#     --extra-index-url https://download.pytorch.org/whl/cu129 \
+#     --index-strategy unsafe-best-match
+#   uv pip install transformers==5.5.0
+#   uv pip install pynvml
+
+pynvml>=11.0

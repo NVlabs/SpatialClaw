@@ -1,0 +1,71 @@
+# Requirements for the SpatialAgent conda environment (agent + managers + GPU server)
+# Install: pip install -r spatial_agent/requirements/requirements-agent.txt
+
+# --- Core agent framework ---
+langgraph>=0.2
+langchain-core>=0.3
+openai>=1.0                 # AsyncOpenAI client for vLLM compatibility
+
+# --- Jupyter kernel execution ---
+jupyter_client>=8.0
+ipykernel>=6.0
+pyzmq>=25.0
+
+# --- CLI & managers ---
+rich>=13.0
+tqdm>=4.60
+
+# --- GPU server (FastAPI) ---
+fastapi>=0.100
+uvicorn[standard]>=0.20
+
+# --- GPU management ---
+pynvml>=11.0
+
+# --- Scientific / vision ---
+numpy>=1.24,<2
+opencv-python-headless>=4.8,<4.13
+Pillow>=10.0
+matplotlib>=3.7
+scipy>=1.10
+pandas>=2.0
+
+# --- Serialization ---
+cloudpickle>=3.0
+requests>=2.28
+shortuuid>=1.0              # workflow session IDs
+
+# --- Video processing ---
+# ffmpeg binary: install via conda (not pip): conda install -y ffmpeg
+# Required by evals/base.py for video frame extraction (ffprobe + ffmpeg)
+
+# --- GPU tools (needed for GPU server) ---
+easyocr>=1.7
+
+# --- SAM3 dependencies (sam3 is installed as editable from tools/third_party/sam3) ---
+# Run: pip install -e "tools/third_party/sam3[dev]"
+# Core deps auto-installed; pycocotools is in [dev] extras and required at import time.
+pycocotools
+
+# --- DA3 dependencies (Depth-Anything-3 is loaded from tools/third_party) ---
+# Keep this to the runtime/API subset used by the GPU server; app/benchmark-only
+# packages such as open3d and pillow-heif are intentionally omitted.
+addict
+einops
+huggingface_hub
+safetensors
+omegaconf
+trimesh
+e3nn
+moviepy==1.0.3
+pycolmap
+
+# --- MapAnything dependencies (map-anything is loaded from tools/third_party) ---
+# Keep rerun below 0.23 so the conda GPU-server env can retain numpy<2 for SAM3.
+hydra-core
+natsort
+orjson
+python-box
+rerun-sdk==0.22.1
+tensorboard
+uniception==0.1.7

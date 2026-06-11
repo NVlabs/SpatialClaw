@@ -1,0 +1,18 @@
+{
+    "accounts": ["llmservice_fm_vision", "nvr_taiwan_rvos", "nvr_lpr_nvgptvision"],
+    "default_slurm": {
+        "gpus": 0,
+        "time_limit": "4:00:00",
+        "partition": "cpu_short,cpu"
+    },
+    "default_concurrency": 8,
+    "default_subsample": 500,
+    "cot_slurm": {
+        "gpus": 0,
+        "time_limit": "4:00:00",
+        "partition": "cpu_short"
+    },
+    "cot_default_concurrency": 32,
+    "cot_default_max_frames": 32,
+    "cot_default_system_prompt": "cot"
+}

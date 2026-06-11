@@ -1,0 +1,5 @@
+{
+    "benchmark": "cvbench",
+    "num_key_frames": 32,
+    "video_max_fps": 1
+}

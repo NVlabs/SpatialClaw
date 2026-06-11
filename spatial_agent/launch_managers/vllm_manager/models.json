@@ -1,0 +1,115 @@
+{
+  "accounts": [
+    "llmservice_fm_vision",
+    "nvr_taiwan_rvos",
+    "nvr_lpr_nvgptvision"
+  ],
+  "default_slurm": {
+    "gpus": 8,
+    "time_limit": "4:00:00",
+    "restart_before_minutes": 20
+  },
+  "models": [
+    {
+      "name": "Qwen3.5-122B-A10B",
+      "model": "Qwen/Qwen3.5-122B-A10B-FP8",
+      "served_name": "qwen3.5-122b-a10b",
+      "max_model_len": 262144,
+      "max_num_seqs": 64,
+      "kv_cache_dtype": "fp8",
+      "tp_size": 4,
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Qwen3.5-122B-A10B-GPTQ-Int4",
+      "model": "Qwen/Qwen3.5-122B-A10B-GPTQ-Int4",
+      "served_name": "qwen3.5-122b-a10b",
+      "max_model_len": 262144,
+      "max_num_seqs": 64,
+      "kv_cache_dtype": "fp8",
+      "tp_size": 2,
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Qwen3.5-397B-A17B",
+      "model": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "served_name": "qwen3.5-397b-a17b",
+      "max_model_len": 131072,
+      "max_num_seqs": 64,
+      "tp_size": 8,
+      "kv_cache_dtype": "fp8",
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Qwen3.5-397B-A17B-GPTQ-Int4",
+      "model": "Qwen/Qwen3.5-397B-A17B-GPTQ-Int4",
+      "served_name": "qwen3.5-397b-a17b",
+      "max_model_len": 262144,
+      "max_num_seqs": 64,
+      "tp_size": 8,
+      "kv_cache_dtype": "fp8",
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Gemma-4-31B-IT-FP8",
+      "model": "prithivMLmods/gemma-4-31B-it-FP8",
+      "served_name": "gemma-4-31b",
+      "max_model_len": 256000,
+      "max_num_seqs": 64,
+      "tp_size": 2,
+      "kv_cache_dtype": "fp8",
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Gemma-4-31B-IT-AWQ",
+      "model": "cyankiwi/gemma-4-31B-it-AWQ-4bit",
+      "served_name": "gemma-4-31b",
+      "max_model_len": 98304,
+      "max_num_seqs": 64,
+      "tp_size": 2,
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Gemma-4-26B-A4B-IT",
+      "model": "google/gemma-4-26B-A4B-it",
+      "served_name": "gemma-4-26b-a4b",
+      "max_model_len": 131072,
+      "max_num_seqs": 64,
+      "tp_size": 2,
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Gemma-4-26B-A4B-IT-FP8",
+      "model": "google/gemma-4-26B-A4B-it",
+      "served_name": "gemma-4-26b-a4b",
+      "max_model_len": 256000,
+      "max_num_seqs": 64,
+      "tp_size": 1,
+      "quantization": "fp8",
+      "kv_cache_dtype": "fp8",
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Qwen3.6-35B-A3B-FP8",
+      "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "served_name": "qwen3.6-35b-a3b",
+      "max_model_len": 262144,
+      "max_num_seqs": 64,
+      "tp_size": 1,
+      "quantization": "fp8",
+      "kv_cache_dtype": "fp8",
+      "partition": "batch_block1,batch_large,batch_long"
+    },
+    {
+      "name": "Qwen3.6-27B",
+      "model": "Qwen/Qwen3.6-27B",
+      "served_name": "qwen3.6-27b",
+      "max_model_len": 262144,
+      "max_num_seqs": 64,
+      "quantization": "fp8",
+      "kv_cache_dtype": "fp8",
+      "tp_size": 2,
+      "partition": "batch_block1,batch_large,batch_long"
+    }
+  ]
+}

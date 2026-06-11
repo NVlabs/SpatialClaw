@@ -1,0 +1,12 @@
+[submodule "tools/third_party/Pi3"]
+	path = tools/third_party/Pi3
+	url = https://github.com/yyfz/Pi3.git
+[submodule "tools/third_party/sam3"]
+	path = tools/third_party/sam3
+	url = https://github.com/facebookresearch/sam3.git
+[submodule "tools/third_party/Depth-Anything-3"]
+	path = tools/third_party/Depth-Anything-3
+	url = https://github.com/ByteDance-Seed/depth-anything-3.git
+[submodule "tools/third_party/map-anything"]
+	path = tools/third_party/map-anything
+	url = https://github.com/facebookresearch/map-anything.git
