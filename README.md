@@ -125,3 +125,12 @@ If you find SpatialClaw useful, please cite the paper:
   year    = {2026}
 }
 ```
+
+## Licenses
+
+Copyright © 2026, NVIDIA Corporation. All rights reserved.
+
+This work is made available under the NVIDIA Source Code License-NC. Click [here](LICENSE) to view a copy of this license.
+
+This work will download and install additional third-party open source software projects. 
+Review the license terms of these open source projects before use (see the corresponding `tools/third_party/<repo>/LICENSE`)
