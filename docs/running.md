@@ -143,6 +143,14 @@ python -m spatial_agent.entrypoints.run \
     --concurrency 4
 ```
 
+The direct GPU server binds to `127.0.0.1` by default. The SLURM manager
+explicitly binds its server to all node interfaces so agents on other nodes can
+reach it; those RPC calls use a per-process bearer token stored in the shared
+GPU server registry with owner-only permissions. For another remote deployment,
+pass `--host 0.0.0.0` (or a specific interface) explicitly and protect access to
+the shared registry. RPC requests use schema-validated JSON; large response
+arrays use schema-validated MessagePack binary values without object hooks.
+
 For a vLLM-served model, launch vLLM separately and ensure your model config has `"llm_base_url": "vllm"` and `"llm_model"` set to the **`served_name`** (e.g. `"gemma-4-31b"`, not the HF path). See [Configuration](configuration.md) for the config schema.
 
 ### Reproducing paper tables

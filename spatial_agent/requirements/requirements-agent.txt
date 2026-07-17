@@ -32,6 +32,7 @@ pandas>=2.0
 
 # --- Serialization ---
 cloudpickle>=3.0
+msgpack>=1.0
 requests>=2.28
 shortuuid>=1.0              # workflow session IDs
 

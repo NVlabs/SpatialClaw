@@ -8,7 +8,6 @@ builder aggregates all descriptions at runtime.
 
 import json
 import logging
-import pickle
 import random
 import socket
 import time
@@ -16,6 +15,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+
+from spatial_agent.gpu_rpc import (
+    PROTOCOL_VERSION,
+    RPCProtocolError,
+    decode_response,
+    encode_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +76,10 @@ def _deployment_to_tool(deployment_name: str) -> Optional[str]:
     return deployment_name[len(prefix):] if deployment_name.startswith(prefix) else deployment_name
 
 
-def _find_alive_server(registry: dict, tool_name: Optional[str] = None) -> Optional[str]:
-    """Pick a random alive server URL that hosts ``tool_name``.
+def _find_alive_server_connection(
+    registry: dict, tool_name: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Pick an authenticated server URL/token pair hosting ``tool_name``.
 
     ``tool_name`` is the short name stored in each registry entry's ``tools``
     list (e.g. ``"Reconstruct"`` or ``"SAM3"``). When None, any alive server
@@ -84,31 +92,45 @@ def _find_alive_server(registry: dict, tool_name: Optional[str] = None) -> Optio
             continue
         ip = info.get("ip")
         port = info.get("http_port")
-        if not ip or not port:
+        auth_token = info.get("auth_token")
+        if (
+            not ip
+            or not port
+            or info.get("protocol_version") != PROTOCOL_VERSION
+            or not isinstance(auth_token, str)
+            or not auth_token
+        ):
             continue
         if _is_port_open(ip, port):
-            return f"http://{ip}:{port}"
+            url_host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+            return f"http://{url_host}:{port}", auth_token
         else:
             logger.debug("[GPUTool] Server %s:%s unreachable, skipping.", ip, port)
     return None
 
 
-def _get_server_url(tool_name: Optional[str] = None) -> str:
-    """Get the HTTP URL of an alive GPU server hosting ``tool_name``.
+def _find_alive_server(registry: dict, tool_name: Optional[str] = None) -> Optional[str]:
+    """Return only the URL of a compatible server, for availability checks."""
+    connection = _find_alive_server_connection(registry, tool_name)
+    return connection[0] if connection else None
+
+
+def _get_server_connection(tool_name: Optional[str] = None) -> tuple[str, str]:
+    """Get an alive authenticated GPU server connection for ``tool_name``.
 
     Non-sticky: selection runs per call so load spreads across all eligible
     servers. Waits up to 4 hours if none are available, polling every 10s.
     """
     registry = _read_registry()
-    url = _find_alive_server(registry, tool_name)
+    connection = _find_alive_server_connection(registry, tool_name)
 
-    if url is None:
+    if connection is None:
         logger.debug("[GPUTool] No alive GPU server found for tool=%s. Waiting...", tool_name)
         for attempt in range(1440):  # 1440 x 10s = 4 hours
             time.sleep(10)
             registry = _read_registry()
-            url = _find_alive_server(registry, tool_name)
-            if url is not None:
+            connection = _find_alive_server_connection(registry, tool_name)
+            if connection is not None:
                 break
             if (attempt + 1) % 6 == 0:
                 elapsed_min = (attempt + 1) * 10 // 60
@@ -119,8 +141,14 @@ def _get_server_url(tool_name: Optional[str] = None) -> str:
                 "Start a GPU server via the agent manager."
             )
 
+    url, auth_token = connection
     logger.debug("[GPUTool] Using GPU server at %s (tool=%s)", url, tool_name)
-    return url
+    return url, auth_token
+
+
+def _get_server_url(tool_name: Optional[str] = None) -> str:
+    """Get only the URL of an alive authenticated GPU server."""
+    return _get_server_connection(tool_name)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +226,7 @@ class GPUTool:
     """Base class for tools that communicate with the GPU server over HTTP.
 
     Subclasses provide synchronous methods that the Jupyter kernel calls.
-    Each remote call is a simple HTTP POST with pickle-serialized data.
+    Each remote call is an authenticated HTTP POST with safely encoded JSON data.
     """
 
     TOOL_PROMPT_DESCRIPTION: str = ""  # Override in subclasses
@@ -226,39 +254,35 @@ class GPUTool:
     def _call_remote(self, method_name: str, **kwargs) -> Any:
         """Call a remote method on the GPU server via HTTP POST.
 
-        The request body is pickle-serialized: {deployment, method, kwargs}.
-        The response body is pickle-serialized: the return value or exception.
+        The request body is JSON: {version, deployment, method, kwargs}.
+        Images, arrays, and known result dataclasses use explicit tagged values.
 
         Retries up to ``self._max_retries`` times with exponential backoff.
         Each attempt re-runs server selection, so a retry naturally lands on
         a different server when multiple are alive.
         """
-        payload = pickle.dumps({
-            "deployment": self._deployment_name,
-            "method": method_name,
-            "kwargs": kwargs,
-        })
+        payload = encode_request(self._deployment_name, method_name, kwargs)
         tool_name = _deployment_to_tool(self._deployment_name)
 
         for attempt in range(self._max_retries):
             try:
-                url = _get_server_url(tool_name)
+                url, auth_token = _get_server_connection(tool_name)
                 resp = requests.post(
                     f"{url}/call",
                     data=payload,
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers={
+                        "Authorization": f"Bearer {auth_token}",
+                        "Content-Type": "application/json",
+                    },
                     timeout=_HTTP_TIMEOUT,
                 )
 
-                result = pickle.loads(resp.content)
-
-                if resp.status_code == 200:
-                    return result
-
-                # Server returned an error — result is the exception
-                if isinstance(result, Exception):
-                    raise result
-                raise RuntimeError(f"GPU server error (HTTP {resp.status_code}): {result}")
+                result = decode_response(resp.content)
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"GPU server returned HTTP {resp.status_code} without an error"
+                    )
+                return result
 
             except Exception as exc:
                 if _is_application_error(exc):
@@ -285,6 +309,8 @@ def _is_application_error(exc: Exception) -> bool:
 
     Application errors (bad inputs, assertion failures) should not be retried.
     """
+    if isinstance(exc, RPCProtocolError):
+        return False
     if isinstance(exc, (AssertionError, ValueError, TypeError)):
         return True
     return False

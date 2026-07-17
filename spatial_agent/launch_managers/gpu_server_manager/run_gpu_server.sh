@@ -38,7 +38,8 @@ export PYTHONPATH="${THIRD_PARTY}/sam3:${THIRD_PARTY}/Pi3:${THIRD_PARTY}/Depth-A
 echo "Loading GPU models..."
 stdbuf -oL -eL python -u -m spatial_agent.entrypoints.launch_gpu_server \
     --num_gpus "$NUM_GPUS" \
-    --reconstruct_backend "$RECONSTRUCT_BACKEND"
+    --reconstruct_backend "$RECONSTRUCT_BACKEND" \
+    --host 0.0.0.0
 
 echo "========================================"
 echo "GPU server stopped"
