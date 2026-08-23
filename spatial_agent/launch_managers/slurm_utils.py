@@ -336,3 +336,117 @@ def cancel_jobs(job_ids: List[str]) -> int:
     if any_ok:
         _invalidate_cache()
     return sent
+
+
+# ---------------------------------------------------------------------------
+# Partition resolution
+# ---------------------------------------------------------------------------
+#
+# Configs list partition *candidates* across all clusters we run on
+# (preference-ordered, comma-separated). sbatch hard-fails if any name in
+# --partition does not exist on the local cluster, so the candidate list is
+# filtered against `sinfo` (existence) and `scontrol show partition`
+# AllowAccounts (accessibility) before it reaches an #SBATCH line.
+
+_PARTITION_INFO_TTL_SECONDS = 300.0
+_partition_cache: Dict[str, tuple] = {}  # key -> (timestamp, value)
+
+
+def _cached(key: str, fetch) -> Optional[str]:
+    now = time.monotonic()
+    hit = _partition_cache.get(key)
+    if hit is not None and now - hit[0] < _PARTITION_INFO_TTL_SECONDS:
+        return hit[1]
+    value = fetch()
+    _partition_cache[key] = (now, value)
+    return value
+
+
+def _existing_partitions() -> Optional[set]:
+    """Set of partition names on this cluster, or None if SLURM is unreachable."""
+
+    def fetch():
+        try:
+            result = subprocess.run(
+                ["sinfo", "-h", "-o", "%R"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        names = set(result.stdout.split())
+        return names or None
+
+    return _cached("sinfo", fetch)
+
+
+def _partition_allows_account(partition: str, account: str) -> bool:
+    """True unless the partition's AllowAccounts list provably excludes *account*.
+
+    Fails open: any query error, missing field, or DenyAccounts-style setups
+    keep the partition (sbatch remains the final authority).
+    """
+
+    def fetch():
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "partition", partition, "-o"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    output = _cached(f"scontrol:{partition}", fetch)
+    if not output:
+        return True
+    for token in output.split():
+        if token.startswith("AllowAccounts="):
+            allowed = token[len("AllowAccounts="):]
+            if allowed.upper() == "ALL":
+                return True
+            return account in allowed.split(",")
+    return True
+
+
+def resolve_partitions(candidates, account: Optional[str] = None) -> str:
+    """Filter a preference-ordered partition candidate list for this cluster.
+
+    ``candidates`` may be a comma-separated string or a list of names.
+    Returns a comma-separated string of the candidates that exist locally
+    (and, when ``account`` is given, are not excluded by AllowAccounts).
+    Order is preserved. Idempotent: already-valid strings pass through.
+
+    SPATIAL_AGENT_SLURM_PARTITION overrides everything verbatim. If SLURM
+    cannot be queried (e.g. non-SLURM machine) the candidates pass through
+    unchanged. Raises RuntimeError when SLURM is reachable but none of the
+    candidates are usable.
+    """
+    override = os.environ.get("SPATIAL_AGENT_SLURM_PARTITION", "").strip()
+    if override:
+        return override
+
+    if isinstance(candidates, str):
+        wanted = [p.strip() for p in candidates.split(",") if p.strip()]
+    else:
+        wanted = [str(p).strip() for p in candidates if str(p).strip()]
+    if not wanted:
+        raise RuntimeError("resolve_partitions: empty candidate list")
+
+    existing = _existing_partitions()
+    if existing is None:
+        return ",".join(wanted)
+
+    usable = [p for p in wanted if p in existing]
+    if account:
+        usable = [p for p in usable if _partition_allows_account(p, account)]
+
+    if not usable:
+        raise RuntimeError(
+            f"None of the candidate partitions {wanted} are usable on this "
+            f"cluster (available: {sorted(existing)}"
+            + (f", account: {account}" if account else "")
+            + "). Set SPATIAL_AGENT_SLURM_PARTITION to override."
+        )
+    return ",".join(usable)

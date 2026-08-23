@@ -20,6 +20,7 @@ from spatial_agent.launch_managers.slurm_utils import (
     batch_query_jobs,
     cancel_jobs,
     check_slurm_available,
+    resolve_partitions,
 )
 from spatial_agent.launch_managers.vllm_manager.state import ChainStateManager
 
@@ -190,7 +191,12 @@ class VLLMManagerCLI:
         max_model_len = self._ask_int("  max_model_len", default=model.max_model_len)
         max_num_seqs = self._ask_int("  max_num_seqs", default=model.max_num_seqs)
         num_instances = max(1, min(32, self._ask_int("  num_instances", default=1)))
-        partition = self._ask("  partition", default=model.partition)
+        try:
+            partition_default = resolve_partitions(model.partition, account)
+        except RuntimeError as exc:
+            self.console.print(f"[yellow]{exc}[/yellow]")
+            partition_default = model.partition
+        partition = self._ask("  partition", default=partition_default)
 
         gpus = model.tp_size
         time_limit = self.config.default_slurm.time_limit

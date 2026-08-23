@@ -19,6 +19,7 @@ from spatial_agent.launch_managers.slurm_utils import (
     batch_query_jobs,
     cancel_jobs,
     check_slurm_available,
+    resolve_partitions,
 )
 
 
@@ -149,12 +150,25 @@ class GPUServerManagerCLI:
             return
 
         self.console.print()
+        try:
+            partition_default = resolve_partitions(
+                self.config.default_slurm.partition, account
+            )
+        except RuntimeError as exc:
+            self.console.print(f"[yellow]{exc}[/yellow]")
+            partition_default = self.config.default_slurm.partition
+        partition = self._ask(
+            "[bold]partition",
+            default=partition_default,
+        )
+
+        self.console.print()
         summary = (
             f"  Servers:    {num_servers}\n"
             f"  GPUs each:  {gpus}\n"
             f"  Backend:    {backend}\n"
             f"  Account:    {account}\n"
-            f"  Partition:  {self.config.default_slurm.partition}\n"
+            f"  Partition:  {partition}\n"
             f"  Time limit: {self.config.default_slurm.time_limit}"
         )
         self.console.print(Panel(summary, title="Confirm GPU Server Launch", border_style="green"))
@@ -172,7 +186,7 @@ class GPUServerManagerCLI:
             srv_state, chain_log = start_chain_background(
                 chain_id=chain_id,
                 account=account,
-                partition=self.config.default_slurm.partition,
+                partition=partition,
                 gpus=gpus,
                 reconstruct_backend=backend,
                 time_limit=self.config.default_slurm.time_limit,

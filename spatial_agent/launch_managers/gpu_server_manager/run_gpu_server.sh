@@ -28,6 +28,15 @@ conda activate spatialagent
 echo "Conda env: $(conda info --envs | grep '*' | awk '{print $1}')"
 echo "Python: $(which python)"
 
+# CUDA forward-compat: torch cu130 in the spatialagent env needs a driver newer
+# than the cluster nodes provide. Reuse the cuda-compat libs from the
+# spatialclaw-cuda env (same mechanism as vllm_manager/run_vllm.sh).
+CUDA_PREFIX="$CONDA_BASE/envs/spatialclaw-cuda"
+if [ -d "$CUDA_PREFIX/cuda-compat" ]; then
+    export LD_LIBRARY_PATH="$CUDA_PREFIX/cuda-compat:${LD_LIBRARY_PATH:-}"
+    echo "CUDA forward-compat enabled: $CUDA_PREFIX/cuda-compat"
+fi
+
 # Add third-party paths so model imports can find sam3, pi3, da3, map-anything, etc.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GCA_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"

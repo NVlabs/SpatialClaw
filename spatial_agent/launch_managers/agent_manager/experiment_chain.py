@@ -26,6 +26,7 @@ from spatial_agent.launch_managers.slurm_utils import (
     check_slurm_available,
     filter_alive_jobs,
     get_job_status,
+    resolve_partitions,
     wait_for_job_visible,
 )
 from spatial_agent.launch_managers.agent_manager import dispatcher as agent_dispatcher
@@ -65,7 +66,7 @@ class ExperimentChain:
         self.model_name = model_name
         self.experiment_name = experiment_name
         self.account = account
-        self.partition = partition
+        self.partition = resolve_partitions(partition, account)
         self.gpus = gpus
         self.time_limit = time_limit
         self.concurrency = concurrency
@@ -139,13 +140,20 @@ class ExperimentChain:
         return str(work_dir)
 
     def _count_predictions(self) -> int:
-        """Count completed samples from predictions.jsonl."""
+        """Count unique, well-formed completed samples from predictions.jsonl."""
         pred_file = os.path.join(self.work_dir, "predictions.jsonl")
         if not os.path.exists(pred_file):
             return 0
         try:
+            sample_ids = set()
             with open(pred_file) as f:
-                return sum(1 for line in f if line.strip())
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        sample_ids.add(str(entry["sample_id"]))
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+            return len(sample_ids)
         except Exception:
             return 0
 
@@ -548,7 +556,10 @@ echo "=========================================="
             # existing sbatch path.
             overlay_dispatched = False
             job_completed = False
-            if self.experiment_type == "agent":
+            overlays_disabled = os.getenv(
+                "SPATIAL_AGENT_DISABLE_OVERLAY", ""
+            ).strip().lower() in {"1", "true", "yes"}
+            if self.experiment_type == "agent" and not overlays_disabled:
                 overlay_args = self._build_agent_script_args()
                 if agent_dispatcher.try_dispatch_overlay(
                     self.project_root,

@@ -153,7 +153,7 @@ setup_vllm() {
         local DG_DIR="${TMPDIR:-/tmp}/DeepGEMM"
         rm -rf "$DG_DIR"
         if git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "$DG_DIR" 2>/dev/null; then
-            local CUDA_HOME_BK="$CUDA_HOME"
+            local CUDA_HOME_BK="${CUDA_HOME:-}"
             export CUDA_HOME="$CONDA_BASE/envs/$CUDA_ENV_NAME"
             export CPLUS_INCLUDE_PATH="$CUDA_HOME/targets/x86_64-linux/include:${CPLUS_INCLUDE_PATH:-}"
             (cd "$DG_DIR" && "$PROJECT_ROOT/.venv/bin/python" setup.py bdist_wheel 2>/dev/null) && {

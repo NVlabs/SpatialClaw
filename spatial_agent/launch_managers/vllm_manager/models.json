@@ -18,7 +18,7 @@
       "max_num_seqs": 64,
       "kv_cache_dtype": "fp8",
       "tp_size": 4,
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Qwen3.5-122B-A10B-GPTQ-Int4",
@@ -28,7 +28,7 @@
       "max_num_seqs": 64,
       "kv_cache_dtype": "fp8",
       "tp_size": 2,
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Qwen3.5-397B-A17B",
@@ -38,7 +38,7 @@
       "max_num_seqs": 64,
       "tp_size": 8,
       "kv_cache_dtype": "fp8",
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Qwen3.5-397B-A17B-GPTQ-Int4",
@@ -48,7 +48,7 @@
       "max_num_seqs": 64,
       "tp_size": 8,
       "kv_cache_dtype": "fp8",
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Gemma-4-31B-IT-FP8",
@@ -58,7 +58,7 @@
       "max_num_seqs": 64,
       "tp_size": 2,
       "kv_cache_dtype": "fp8",
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Gemma-4-31B-IT-AWQ",
@@ -67,7 +67,7 @@
       "max_model_len": 98304,
       "max_num_seqs": 64,
       "tp_size": 2,
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Gemma-4-26B-A4B-IT",
@@ -76,7 +76,7 @@
       "max_model_len": 131072,
       "max_num_seqs": 64,
       "tp_size": 2,
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Gemma-4-26B-A4B-IT-FP8",
@@ -87,7 +87,7 @@
       "tp_size": 1,
       "quantization": "fp8",
       "kv_cache_dtype": "fp8",
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Qwen3.6-35B-A3B-FP8",
@@ -98,7 +98,7 @@
       "tp_size": 1,
       "quantization": "fp8",
       "kv_cache_dtype": "fp8",
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     },
     {
       "name": "Qwen3.6-27B",
@@ -109,7 +109,7 @@
       "quantization": "fp8",
       "kv_cache_dtype": "fp8",
       "tp_size": 2,
-      "partition": "batch_block1,batch_large,batch_long"
+      "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
     }
   ]
 }

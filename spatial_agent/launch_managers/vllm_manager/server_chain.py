@@ -28,6 +28,7 @@ from spatial_agent.launch_managers.slurm_utils import (
     filter_alive_jobs,
     get_job_status,
     is_job_alive,
+    resolve_partitions,
     wait_for_job_visible,
 )
 
@@ -67,7 +68,7 @@ class ServerChain:
         self.model_name = model_name
         self.model_path = model_path
         self.account = account
-        self.partition = partition
+        self.partition = resolve_partitions(partition, account)
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.tp_size = tp_size

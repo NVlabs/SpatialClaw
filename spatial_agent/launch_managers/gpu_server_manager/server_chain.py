@@ -28,6 +28,7 @@ from spatial_agent.launch_managers.slurm_utils import (
     filter_alive_jobs,
     get_job_status,
     is_job_alive,
+    resolve_partitions,
     wait_for_job_visible,
 )
 from spatial_agent.launch_managers.gpu_server_manager.state import (
@@ -58,7 +59,7 @@ class ServerChain:
     ):
         self.chain_id = chain_id
         self.account = account
-        self.partition = partition
+        self.partition = resolve_partitions(partition, account)
         self.gpus = gpus
         self.reconstruct_backend = reconstruct_backend
         self.time_limit = time_limit

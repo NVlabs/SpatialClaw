@@ -49,6 +49,22 @@ _UNHEALTHY_COOLDOWN_SEC = 60.0
 _HEALTH_CHECK_TIMEOUT_SEC = 3
 
 
+def _positive_timeout_from_env(name: str, default: float) -> float:
+    """Return a positive timeout override, or *default* when unset/invalid."""
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r", name, raw)
+        return float(default)
+    if value <= 0:
+        logger.warning("Ignoring non-positive %s=%r", name, raw)
+        return float(default)
+    return value
+
+
 def image_to_base64_url(img: Image.Image, max_size: int = 1024) -> str:
     """Encode a PIL image as a base64 data URI, resizing if needed."""
     w, h = img.size
@@ -96,6 +112,13 @@ class LLMClient:
     def __init__(self, config: SpatialAgentConfig):
         self.config = config
         self._model = config.llm_model
+        self._llm_request_timeout_sec = _positive_timeout_from_env(
+            "SPATIAL_AGENT_LLM_REQUEST_TIMEOUT_SEC", 600,
+        )
+        self._vlm_request_timeout_sec = _positive_timeout_from_env(
+            "SPATIAL_AGENT_VLM_REQUEST_TIMEOUT_SEC",
+            config.vlm_query_timeout_sec,
+        )
         self._endpoints: List[str] = []
         self._api_key = (
             config.llm_api_key
@@ -586,7 +609,7 @@ class LLMClient:
                             messages=messages,
                             **api_kwargs,
                         ),
-                        timeout=600,
+                        timeout=self._llm_request_timeout_sec,
                     )
                 except self._RETRYABLE_ERRORS as exc:
                     last_exc = exc
@@ -723,7 +746,7 @@ class LLMClient:
                             messages=messages,
                             **api_kwargs,
                         ),
-                        timeout=self.config.vlm_query_timeout_sec,
+                        timeout=self._vlm_request_timeout_sec,
                     )
                 except self._RETRYABLE_ERRORS as exc:
                     last_exc = exc

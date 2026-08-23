@@ -300,7 +300,7 @@ class PerFrameMask(PerFrameData):
                 frame_index=frame_idx,
             )
 
-        cmap = plt.cm.get_cmap("gist_rainbow", max(n_obj, 1))
+        cmap = plt.get_cmap("gist_rainbow", max(n_obj, 1))
 
         for i in range(n_obj):
             mask = frame_masks[i]  # (H, W) bool

@@ -2,6 +2,7 @@
 
 import ast
 import json
+import os
 import re
 from typing import Any, Dict, List
 
@@ -17,6 +18,20 @@ from spatial_agent.state import AgentState
 # ---------------------------------------------------------------------------
 
 _SHOW_RE = re.compile(r"^\[SHOW:(\{.*\})\]$", re.MULTILINE)
+
+
+def _effective_cell_timeout(configured_timeout: float) -> float:
+    """Allow an infrastructure override to extend, but never shorten, a cell timeout."""
+    raw = os.getenv("SPATIAL_AGENT_CELL_TIMEOUT_SEC")
+    if raw is None:
+        return float(configured_timeout)
+    try:
+        override = float(raw)
+    except ValueError:
+        return float(configured_timeout)
+    if override <= 0:
+        return float(configured_timeout)
+    return max(float(configured_timeout), override)
 
 
 def _parse_show_markers(stdout: str) -> List[Dict[str, Any]]:
@@ -150,7 +165,10 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
         vlm_module.get_and_clear_queries()
 
     # 3. Execute in the Jupyter kernel
-    result = await km.execute(code, timeout=agent_config.timeout_sec)
+    result = await km.execute(
+        code,
+        timeout=_effective_cell_timeout(agent_config.timeout_sec),
+    )
 
     # 4. Count tool calls (regex on code)
     tool_calls = len(re.findall(r"tools\.\w+\.\w+\(", code))

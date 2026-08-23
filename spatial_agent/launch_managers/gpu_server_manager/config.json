@@ -8,7 +8,7 @@
     "gpus": 1,
     "time_limit": "4:00:00",
     "restart_before_minutes": 20,
-    "partition": "batch_block1,batch_large,batch_long"
+    "partition": "batch,batch_block1,batch_block3,batch_block4,polar,polar3,polar4,batch_large,batch_large_long"
   },
   "reconstruct_backend": "da3"
 }

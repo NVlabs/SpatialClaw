@@ -56,7 +56,7 @@ async def worker(workflow, benchmark, sample, predictions, pred_file, semaphore,
         run_result = None
         try:
             if hasattr(sample, "ensure_frames_loaded"):
-                sample.ensure_frames_loaded()
+                await asyncio.to_thread(sample.ensure_frames_loaded)
 
             instruction = f"{sample.question}\n\n{benchmark.data_specific_prompt}"
 
@@ -95,9 +95,9 @@ async def worker(workflow, benchmark, sample, predictions, pred_file, semaphore,
             traceback.print_exc()
             answer_text = ""
 
+        gt = getattr(sample, "answer", None)
         async with lock:
             predictions[sid] = answer_text
-            gt = getattr(sample, "answer", None)
             entry = {"sample_id": str(sid), "content": answer_text}
             if gt is not None:
                 entry["ground_truth"] = str(gt)
@@ -109,20 +109,21 @@ async def worker(workflow, benchmark, sample, predictions, pred_file, semaphore,
             with open(pred_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
 
-            report_ctx = run_result.get("_report_context") if run_result else None
-            if report_ctx and workflow.config.generate_report:
-                try:
-                    workflow.generate_report(
-                        session_dir=report_ctx["session_dir"],
-                        session_id=str(sid),
-                        instruction=report_ctx["instruction"],
-                        images=report_ctx["images"],
-                        ground_truth=gt,
-                        final_state=report_ctx["final_state"],
-                        result_score=score,
-                    )
-                except Exception:
-                    pass
+        report_ctx = run_result.get("_report_context") if run_result else None
+        if report_ctx and workflow.config.generate_report:
+            try:
+                await asyncio.to_thread(
+                    workflow.generate_report,
+                    session_dir=report_ctx["session_dir"],
+                    session_id=str(sid),
+                    instruction=report_ctx["instruction"],
+                    images=report_ctx["images"],
+                    ground_truth=gt,
+                    final_state=report_ctx["final_state"],
+                    result_score=score,
+                )
+            except Exception as exc:
+                print(f"[Warning] Failed to generate report for sample {sid}: {exc}")
 
 
 async def main():
