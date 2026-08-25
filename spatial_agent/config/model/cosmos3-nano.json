@@ -1,0 +1,37 @@
+{
+    "llm_model": "cosmos3-nano",
+    "llm_base_url": "vllm",
+    "llm_api_key": "bearer",
+    "roles": {
+        "main": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "planning": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "general": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "vlm": {
+            "max_tokens": 32768,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "vlm_grounding": {
+            "max_tokens": 16384,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        }
+    }
+}

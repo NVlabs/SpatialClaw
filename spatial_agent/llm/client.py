@@ -514,6 +514,36 @@ class LLMClient:
 
         return kwargs
 
+    @staticmethod
+    def _normalize_multimodal_order(
+        model: str,
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Put media before text in Cosmos3 user messages.
+
+        Cosmos3's prompt format expects visual inputs before user text. The
+        stable sort preserves media order and text order, and copies only the
+        affected message/content containers so LangGraph state is unchanged.
+        """
+        if "cosmos3" not in model.lower():
+            return messages
+
+        media_types = {"image_url", "video_url", "image", "video"}
+        normalized = []
+        for message in messages:
+            content = message.get("content")
+            if message.get("role") == "user" and isinstance(content, list):
+                content = sorted(
+                    content,
+                    key=lambda part: not (
+                        isinstance(part, dict)
+                        and part.get("type") in media_types
+                    ),
+                )
+                message = {**message, "content": content}
+            normalized.append(message)
+        return normalized
+
     # ------------------------------------------------------------------
     # Gemma-4 thinking workaround
     # ------------------------------------------------------------------
@@ -588,6 +618,7 @@ class LLMClient:
         """
         params = role_params or self.config.main_params
         api_kwargs = self._build_api_kwargs(params)
+        messages = self._normalize_multimodal_order(self._model, messages)
 
         # Proactive re-discovery before picking endpoint
         await self._maybe_rediscover()

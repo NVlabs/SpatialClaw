@@ -183,6 +183,12 @@ def get_launcher(args) -> List[str]:
             '--media-io-kwargs', '{"video": {"num_frames": -1}}',
         ])
 
+    if 'cosmos3' in model_id:
+        vllm_args.extend([
+            '--mm-encoder-tp-mode', 'data',
+            '--async-scheduling',
+        ])
+
     if 'qwen3.5' in model_id:
         # Qwen3.5 recipe:
         # - reasoning parser improves think/answer handling
