@@ -2,6 +2,8 @@
     "llm_model": "cosmos3-nano",
     "llm_base_url": "vllm",
     "llm_api_key": "bearer",
+    "explicit_planner_frame_mapping": true,
+    "safe_multimodal_fallback": true,
     "roles": {
         "main": {
             "max_tokens": 131072,

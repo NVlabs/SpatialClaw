@@ -156,6 +156,12 @@ class SpatialAgentConfig:
     max_tool_calls: int = -1
     timeout_sec: int = 600  # per Jupyter cell execution
 
+    # --- Opt-in Protocol Fixes ---
+    # Disabled by default so existing backbone configs retain legacy behavior.
+    # Model configs may enable either fix independently.
+    explicit_planner_frame_mapping: bool = False
+    safe_multimodal_fallback: bool = False
+
     # --- Executor Variant ---
     # "code"        : free-form Python per step (default, the SpatialClaw interface).
     # "react"       : one structured tool-call per step; translated to code.
@@ -299,6 +305,17 @@ class SpatialAgentConfig:
         for key in ("llm_model", "llm_base_url", "llm_api_key"):
             if key in data and data[key] is not None:
                 setattr(self, key, _expand_env_vars(data[key]))
+
+        # Optional model-specific protocol fixes. Keeping these default-off
+        # preserves legacy behavior for every backbone that does not opt in.
+        for key in (
+            "explicit_planner_frame_mapping",
+            "safe_multimodal_fallback",
+        ):
+            if key in data and data[key] is not None:
+                if not isinstance(data[key], bool):
+                    raise ValueError(f"Model config field {key!r} must be a boolean")
+                setattr(self, key, data[key])
 
         # Role params
         roles = data.get("roles", {})

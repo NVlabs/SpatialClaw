@@ -330,6 +330,7 @@ def build_planning_user_message(
     key_frame_list_indices: Optional[List[int]] = None,
     key_frame_video_idx: Optional[List[int]] = None,
     num_total_images: int = 0,
+    explicit_frame_mapping: bool = False,
 ) -> dict:
     """Build an OpenAI-format user message with key frames for the planner."""
 
@@ -391,9 +392,20 @@ def build_planning_user_message(
     else:
         text = f"Question: {instruction}"
         if key_frame_indices:
-            text = (
-                f"The input has {len(key_frame_indices)} frames "
-                f"(frame indices: {key_frame_indices}).\n\n"
-                f"Question: {instruction}"
-            )
+            if explicit_frame_mapping:
+                total = num_total_images or len(key_frame_indices)
+                local_indices = key_frame_list_indices or list(range(len(key_frame_indices)))
+                text = (
+                    f"The input timeline has {total} sampled frames. The executing "
+                    f"agent initially sees {len(key_frame_indices)} key frames at "
+                    f"InputImages list indices {local_indices} (source-video frame "
+                    f"indices: {key_frame_indices}).\n\n"
+                    f"Question: {instruction}"
+                )
+            else:
+                text = (
+                    f"The input has {len(key_frame_indices)} frames "
+                    f"(frame indices: {key_frame_indices}).\n\n"
+                    f"Question: {instruction}"
+                )
         return {"role": "user", "content": text}

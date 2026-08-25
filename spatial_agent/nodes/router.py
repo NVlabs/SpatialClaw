@@ -67,6 +67,9 @@ async def force_terminate(state: AgentState, config: RunnableConfig) -> Dict[str
     llm_client = cfg.get("llm_client")
     key_frames = cfg.get("key_frames", [])
     agent_config = cfg.get("agent_config")
+    safe_multimodal_fallback = bool(
+        getattr(agent_config, "safe_multimodal_fallback", False)
+    )
 
     # Determine reason
     reason = "unknown"
@@ -108,11 +111,17 @@ async def force_terminate(state: AgentState, config: RunnableConfig) -> Dict[str
             logger.info("CoT fallback produced answer: %s", partial_answer[:200])
         except Exception as exc:
             logger.warning("CoT fallback VLM call failed: %s — falling back to regex", exc)
-            partial_answer = _extract_partial_answer(state)
+            partial_answer = _extract_partial_answer(
+                state,
+                safe_multimodal_fallback=safe_multimodal_fallback,
+            )
             fallback_method = "regex"
 
     if not partial_answer:
-        partial_answer = _extract_partial_answer(state)
+        partial_answer = _extract_partial_answer(
+            state,
+            safe_multimodal_fallback=safe_multimodal_fallback,
+        )
         fallback_method = fallback_method or "regex"
 
     # Checklist stats for post-hoc analysis
@@ -178,7 +187,40 @@ def _parse_boxed_answer(text: str) -> str:
     return ""
 
 
-def _extract_partial_answer(state: AgentState) -> str:
+def _message_text(content: Any) -> str:
+    """Return only textual parts from a LangChain message payload.
+
+    Multimodal ``HumanMessage.content`` is a list of text/image dictionaries.
+    Stringifying that list is both expensive (it may include base64 images) and
+    unsafe for regex matching.  Ignore non-text blocks and preserve the text
+    blocks in their original order.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+            continue
+        if block.get("type") == "text" and isinstance(block.get("content"), str):
+            parts.append(block["content"])
+    return "\n".join(parts)
+
+
+def _extract_partial_answer(
+    state: AgentState,
+    *,
+    safe_multimodal_fallback: bool = False,
+) -> str:
     """Try to extract a partial answer from conversation or variables."""
 
     # Look for any ReturnAnswer-like variables
@@ -189,7 +231,11 @@ def _extract_partial_answer(state: AgentState) -> str:
     # Scan messages for MC letter patterns or answer content
     messages = state.get("messages", [])
     for msg in reversed(messages[-10:]):
-        content = msg.content if hasattr(msg, "content") else str(msg)
+        if safe_multimodal_fallback:
+            content = _message_text(msg.content) if hasattr(msg, "content") else ""
+        else:
+            # Preserve the historical behavior unless the model opts in.
+            content = msg.content if hasattr(msg, "content") else str(msg)
         # Look for explicit answer mentions like "answer is B" or "The answer: A"
         m = re.search(r"(?:answer|choice)\s*(?:is|:)\s*([A-Z])\b", content, re.IGNORECASE)
         if m:

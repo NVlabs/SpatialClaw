@@ -91,6 +91,9 @@ async def plan_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]
         key_frame_list_indices=key_frame_list_indices,
         key_frame_video_idx=key_frame_video_idx,
         num_total_images=num_total_images,
+        explicit_frame_mapping=getattr(
+            agent_config, "explicit_planner_frame_mapping", False
+        ),
     )
 
     messages_for_llm = [
