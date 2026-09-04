@@ -10,8 +10,11 @@ Usage::
 
 import argparse
 import asyncio
+import datetime
+import hashlib
 import json
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -70,11 +73,196 @@ def _load_images(
     return imgs
 
 
+def _endpoint_inclusive_indices(num_images: int, budget: int) -> List[int]:
+    """Match ``SpatialAgentWorkflow`` key-frame selection exactly."""
+    if num_images <= 0 or budget <= 0:
+        return []
+    count = min(num_images, budget)
+    if count >= num_images:
+        return list(range(num_images))
+    if count == 1:
+        return [0]
+    return [round(i * (num_images - 1) / (count - 1)) for i in range(count)]
+
+
+def _load_spatial_agent_image(
+    image: Any,
+    max_long_edge: Optional[int],
+    backend: str,
+) -> Image.Image:
+    """Load and resize one image with the workflow's backend-aware path."""
+    if isinstance(image, (str, os.PathLike)):
+        loaded = Image.open(image).convert("RGB")
+    else:
+        loaded = image
+    if max_long_edge:
+        from spatial_agent.gpu_models.image_resize import (
+            resize_for_input_images_for_backend,
+        )
+
+        loaded = resize_for_input_images_for_backend(
+            loaded, max_long_edge, backend
+        )
+    return loaded
+
+
+def _rgb_fingerprint(image: Image.Image) -> str:
+    return hashlib.sha256(image.convert("RGB").tobytes()).hexdigest()
+
+
+def _prepare_spatial_agent_visuals(
+    sample: Any,
+    *,
+    num_key_frames: int,
+    max_long_edge: Optional[int],
+    backend: str,
+    record_fingerprints: bool,
+) -> tuple[List[Image.Image], Optional[Dict[str, Any]]]:
+    """Prepare the exact visual sequence supplied by ``SpatialAgentWorkflow``.
+
+    This is an opt-in CoT control path. The legacy CoT frame sampler remains
+    unchanged so prior baselines for other backbones keep their behavior.
+    """
+    images = getattr(sample, "images", None) or []
+    image_groups = getattr(sample, "image_groups", None) or []
+    frame_indices = getattr(sample, "frame_indices", None)
+    frame_indices_groups = getattr(sample, "frame_indices_groups", None) or []
+    is_multi_video = bool(image_groups) and len(image_groups) > 1
+
+    key_frames: List[Image.Image] = []
+    key_frame_indices: List[int] = []
+    key_frame_list_indices: List[int] = []
+    key_frame_video_indices: List[int] = []
+    if num_key_frames > 0:
+        if is_multi_video:
+            for video_index, group in enumerate(image_groups):
+                selected = _endpoint_inclusive_indices(
+                    len(group), num_key_frames
+                )
+                source_indices = (
+                    frame_indices_groups[video_index]
+                    if video_index < len(frame_indices_groups)
+                    else None
+                )
+                for local_index in selected:
+                    key_frames.append(_load_spatial_agent_image(
+                        group[local_index], max_long_edge, backend
+                    ))
+                    absolute_index = (
+                        source_indices[local_index]
+                        if source_indices and local_index < len(source_indices)
+                        else local_index
+                    )
+                    key_frame_indices.append(absolute_index)
+                    key_frame_list_indices.append(local_index)
+                    key_frame_video_indices.append(video_index + 1)
+        else:
+            for local_index in _endpoint_inclusive_indices(
+                len(images), num_key_frames
+            ):
+                key_frames.append(_load_spatial_agent_image(
+                    images[local_index], max_long_edge, backend
+                ))
+                absolute_index = (
+                    frame_indices[local_index]
+                    if frame_indices and local_index < len(frame_indices)
+                    else local_index
+                )
+                key_frame_indices.append(absolute_index)
+                key_frame_list_indices.append(local_index)
+                key_frame_video_indices.append(0)
+
+    reference_images = [
+        _load_spatial_agent_image(image, max_long_edge, backend)
+        for image in (getattr(sample, "ref_images", None) or [])
+    ]
+
+    fingerprint: Optional[Dict[str, Any]] = {
+        "evidence_schema_version": 1,
+        "fingerprint_valid": False,
+    }
+    if record_fingerprints:
+        try:
+            fingerprint = {
+                "evidence_schema_version": 1,
+                "fingerprint_valid": True,
+                "video_source": getattr(sample, "video", None),
+                "video_sources": (
+                    getattr(sample, "video_sources_per_video", None) or []
+                ),
+                "key_frames": [
+                    {
+                        "context_position": position,
+                        "video_index": key_frame_video_indices[position],
+                        "local_index": key_frame_list_indices[position],
+                        "frame_index": key_frame_indices[position],
+                        "mode": image.mode,
+                        "size": list(image.size),
+                        "rgb_sha256": _rgb_fingerprint(image),
+                    }
+                    for position, image in enumerate(key_frames)
+                ],
+                "reference_images": [
+                    {
+                        "reference_index": position,
+                        "mode": image.mode,
+                        "size": list(image.size),
+                        "rgb_sha256": _rgb_fingerprint(image),
+                    }
+                    for position, image in enumerate(reference_images)
+                ],
+            }
+        except Exception as exc:
+            fingerprint = {
+                "evidence_schema_version": 1,
+                "fingerprint_valid": False,
+                "evidence_error": {
+                    "stage": "input_fingerprint",
+                    "exception_type": type(exc).__name__,
+                },
+            }
+
+    return key_frames + reference_images, fingerprint
+
+
 def _extract_boxed(text: str) -> str:
     """Strip \\boxed{...} wrapper from LLM output, returning the inner content."""
     import re
     m = re.search(r"\\boxed\{(.+)\}", text, re.DOTALL)
     return m.group(1).strip() if m else text
+
+
+def _benchmark_evidence(benchmark, answer_text: str) -> Dict[str, Any]:
+    """Extract comparison-only evidence after the normal scoring call."""
+    try:
+        value = benchmark.extract_answer(answer_text)
+        if not isinstance(value, str):
+            raise TypeError("benchmark extraction did not return a string")
+        return {
+            "evidence_schema_version": 1,
+            "benchmark_extraction_valid": True,
+            "benchmark_extracted": value,
+        }
+    except Exception as exc:
+        return {
+            "evidence_schema_version": 1,
+            "benchmark_extraction_valid": False,
+            "benchmark_evidence_error": {
+                "stage": "benchmark_extraction",
+                "exception_type": type(exc).__name__,
+            },
+        }
+
+
+def _invalid_input_evidence(stage: str, exception_type: str) -> Dict[str, Any]:
+    return {
+        "evidence_schema_version": 1,
+        "fingerprint_valid": False,
+        "evidence_error": {
+            "stage": stage,
+            "exception_type": exception_type,
+        },
+    }
 
 
 def _build_question(sample, benchmark, prompt_style: str = "cot") -> str:
@@ -111,16 +299,30 @@ async def worker(
     sample,
     predictions: Dict,
     pred_file: str,
+    input_manifest_file: str,
     semaphore: asyncio.Semaphore,
     lock: asyncio.Lock,
     max_frames: int,
     max_long_edge: Optional[int],
+    frame_preparation: str,
+    num_key_frames: int,
+    reconstruct_backend: str,
+    record_input_fingerprints: bool,
+    finalize_on_llm_timeout: bool = False,
+    generation_timeout_sec: Optional[float] = None,
     role_params=None,
     system_prompt: str = COT_SYSTEM_PROMPT,
     prompt_style: str = "cot",
 ):
     async with semaphore:
+        sample_started_at = (
+            time.monotonic() if record_input_fingerprints else None
+        )
         sid = sample.sample_id
+        input_fingerprint: Optional[Dict[str, Any]] = _invalid_input_evidence(
+            "input_preparation", "MissingEvidence",
+        )
+        terminal_failure: Optional[Dict[str, Any]] = None
         try:
             # Ensure video frames are extracted (VLM4D lazy loading)
             if hasattr(sample, "ensure_frames_loaded"):
@@ -128,11 +330,63 @@ async def worker(
                     None, sample.ensure_frames_loaded
                 )
 
-            # Select and load key frames (run in executor to avoid blocking event loop)
-            key_paths = _select_key_frames(sample.images, max_frames)
-            images = await asyncio.get_event_loop().run_in_executor(
-                None, _load_images, key_paths, max_long_edge
-            )
+            # Select and load key frames (run in a thread to avoid blocking the
+            # event loop). The opt-in path exactly mirrors SpatialClaw's
+            # endpoint-inclusive selection and backend-aware preprocessing.
+            if frame_preparation == "spatial-agent":
+                images, input_fingerprint = await asyncio.to_thread(
+                    _prepare_spatial_agent_visuals,
+                    sample,
+                    num_key_frames=num_key_frames,
+                    max_long_edge=max_long_edge,
+                    backend=reconstruct_backend,
+                    record_fingerprints=record_input_fingerprints,
+                )
+            else:
+                key_paths = _select_key_frames(sample.images, max_frames)
+                images = await asyncio.to_thread(
+                    _load_images, key_paths, max_long_edge
+                )
+                if record_input_fingerprints:
+                    try:
+                        input_fingerprint = {
+                            "evidence_schema_version": 1,
+                            "fingerprint_valid": True,
+                            "frame_preparation": "legacy",
+                            "video_source": str(
+                                getattr(sample, "video", "") or ""
+                            ),
+                            "video_sources": [
+                                str(value)
+                                for value in (
+                                    getattr(
+                                        sample,
+                                        "video_sources_per_video",
+                                        None,
+                                    ) or []
+                                )
+                            ],
+                            "key_frames": [
+                                {
+                                    "context_position": position,
+                                    "source": str(key_paths[position]),
+                                    "mode": image.mode,
+                                    "size": list(image.size),
+                                    "rgb_sha256": _rgb_fingerprint(image),
+                                }
+                                for position, image in enumerate(images)
+                            ],
+                            "reference_images": [],
+                        }
+                    except Exception as exc:
+                        input_fingerprint = _invalid_input_evidence(
+                            "input_fingerprint", type(exc).__name__,
+                        )
+                else:
+                    input_fingerprint = {
+                        "evidence_schema_version": 1,
+                        "fingerprint_valid": False,
+                    }
             if not images:
                 raise RuntimeError(f"No images loaded for sample {sid}")
 
@@ -140,6 +394,7 @@ async def worker(
 
             # Single VLM call — retry indefinitely on server unavailability
             from openai import APIConnectionError, APITimeoutError
+            from spatial_agent.llm.client import LLMGenerationTimeoutError
             _server_errors = (
                 asyncio.TimeoutError, ConnectionError, OSError,
                 APIConnectionError, APITimeoutError,
@@ -155,6 +410,28 @@ async def worker(
                         usage_session_id=str(sid),
                     )
                     break
+                except LLMGenerationTimeoutError as exc:
+                    if not finalize_on_llm_timeout:
+                        print(
+                            f"[Wait] Sample {sid}: server unavailable "
+                            f"({type(exc).__name__}), retrying in 30s..."
+                        )
+                        # Preserve the historical retry/re-discovery behavior
+                        # unless the selected model profile explicitly opts in.
+                        llm_client._last_discovery = 0
+                        await asyncio.sleep(30)
+                        continue
+                    answer_text = ""
+                    terminal_failure = {
+                        "reason": "llm_generation_timeout",
+                        "request_kind": exc.request_kind,
+                        "attempts": exc.attempts,
+                        "request_timeout_sec": generation_timeout_sec,
+                    }
+                    print(
+                        f"[Terminal] Sample {sid}: {exc}; recording failed row."
+                    )
+                    break
                 except _server_errors as exc:
                     print(
                         f"[Wait] Sample {sid}: server unavailable ({type(exc).__name__}), "
@@ -168,20 +445,45 @@ async def worker(
             print(f"[Error] Sample {sid}: {exc}")
             traceback.print_exc()
             answer_text = ""
+            terminal_failure = {
+                "reason": "worker_exception",
+                "exception_type": type(exc).__name__,
+            }
 
         async with lock:
             extracted = _extract_boxed(answer_text)
             predictions[sid] = extracted
             gt = getattr(sample, "answer", None)
             entry = {"sample_id": str(sid), "content": answer_text, "extracted": extracted}
+            if record_input_fingerprints:
+                entry["wall_time_sec"] = time.monotonic() - sample_started_at
             if gt is not None:
                 entry["ground_truth"] = str(gt)
             result = benchmark.evaluate_single(sample, extracted)
             if result is not None:
                 entry["result"] = result
+            if record_input_fingerprints:
+                entry.update(_benchmark_evidence(benchmark, extracted))
             entry["usage"] = llm_client.pop_session_usage(str(sid))
+            if terminal_failure is not None:
+                entry["terminal_failure"] = terminal_failure
             with open(pred_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+            if record_input_fingerprints:
+                input_entry = {
+                    "sample_id": str(sid),
+                    **(input_fingerprint or _invalid_input_evidence(
+                        "input_preparation", "MissingEvidence",
+                    )),
+                }
+                try:
+                    with open(input_manifest_file, "a") as f:
+                        f.write(json.dumps(input_entry, default=str) + "\n")
+                except Exception as exc:
+                    print(
+                        f"[Warning] Input evidence write failed for sample {sid}: "
+                        f"{type(exc).__name__}"
+                    )
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -202,6 +504,27 @@ def parse_args():
     parser.add_argument("--llm_base_url", type=str, default=None)
     parser.add_argument("--max_frames", type=int, default=32,
                         help="Max frames to send to the VLM per sample")
+    parser.add_argument(
+        "--frame-preparation",
+        choices=["legacy", "spatial-agent"],
+        default=None,
+        help=(
+            "Visual preparation path. 'spatial-agent' exactly matches "
+            "SpatialClaw key-frame selection and backend-aware resizing; "
+            "'legacy' preserves historical CoT behavior. When omitted, the "
+            "model config's cot_frame_preparation value is used."
+        ),
+    )
+    parser.add_argument(
+        "--record-input-fingerprints",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Record exact RGB hashes for the visual inputs supplied to CoT.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Set the generation seed for paired repeat runs.",
+    )
     parser.add_argument("--sample_ids", nargs="+", default=None)
     parser.add_argument("--shuffle", action="store_true",
                         help="Shuffle samples before applying --limit (for random sampling)")
@@ -226,29 +549,49 @@ async def main():
     config.update_from_dataset_json(args.dataset)
     if args.model:
         config.update_from_model_json(args.model)
+    if args.frame_preparation is None:
+        args.frame_preparation = config.cot_frame_preparation
+    else:
+        config.cot_frame_preparation = args.frame_preparation
     config.update_from_args(args)
+    if args.seed is not None:
+        config.general_params.seed = args.seed
 
     # Override defaults for CoT baseline (no tools, no kernel)
     config.tools_to_use = []
+    config.validate()
 
     # Default concurrency is higher for CoT (no GPU tools needed)
     if config.concurrency == 1 and args.concurrency is None:
         config.concurrency = 32
 
-    # Work dir
+    # Work dir. Named model profiles use isolated output roots so a Cosmos
+    # configuration update cannot resume historical baseline predictions.
     if not config.work_dir:
         _pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         model_short = (
             config.llm_model.split("/")[-1][:30] if config.llm_model else "unknown"
         )
+        model_variant = config.model_profile or model_short
         config.work_dir = os.path.join(
-            _pkg_dir, "work_dir", f"cot_{config.benchmark}_{model_short}"
+            _pkg_dir, "work_dir", f"cot_{config.benchmark}_{model_variant}"
         )
     os.makedirs(config.work_dir, exist_ok=True)
-
-    # Save config snapshot
-    with open(os.path.join(config.work_dir, "config.json"), "w") as f:
-        json.dump(config.to_dict(), f, indent=2, default=str)
+    preflight_predictions = os.path.join(config.work_dir, "predictions.jsonl")
+    preflight_identity_enforced = bool(
+        config.record_input_fingerprints
+        or os.environ.get("SPATIAL_AGENT_SEALED_GIT_HEAD")
+    )
+    if not (
+        args.resume
+        and preflight_identity_enforced
+        and os.path.isfile(preflight_predictions)
+        and os.path.getsize(preflight_predictions) > 0
+    ):
+        # Keep the historical early snapshot for empty/new work directories,
+        # but never overwrite evidence beside an unverified sealed resume.
+        with open(os.path.join(config.work_dir, "config.json"), "w") as f:
+            json.dump(config.to_dict(), f, indent=2, default=str)
 
     set_config(config)
 
@@ -281,15 +624,99 @@ async def main():
         if config.limit:
             benchmark.data = benchmark.data[: config.limit]
 
+    from spatial_agent.entrypoints.run import (
+        _effective_evaluation_config_sha256,
+        _establish_run_manifest,
+        _sealed_git_head_from_environment,
+        _sha256_file,
+        _source_tree_sha256,
+    )
+    from spatial_agent.llm.client import resolve_request_timeouts
+
+    effective_request_timeouts = resolve_request_timeouts(config)
+
+    record_input_fingerprints = bool(
+        getattr(config, "record_input_fingerprints", False)
+    )
+    sealed_git_head = _sealed_git_head_from_environment()
+    provenance_enabled = bool(
+        record_input_fingerprints or sealed_git_head is not None
+    )
+    run_manifest = None
+    if provenance_enabled:
+        sample_ids = [str(sample.sample_id) for sample in benchmark]
+        cohort_bytes = ("\n".join(sample_ids) + "\n").encode("utf-8")
+        package_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        run_manifest = {
+            "schema_version": 1,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "entrypoint": "cot_baseline",
+            "benchmark": config.benchmark,
+            "model": config.llm_model,
+            "model_profile": config.model_profile,
+            "seed": args.seed,
+            "requested_subsample": args.subsample,
+            "selection_seed": 42 if args.subsample is not None else None,
+            "applied_samples": len(sample_ids),
+            "concurrency": config.concurrency,
+            "max_frames": args.max_frames,
+            "system_prompt": args.system_prompt,
+            "resume_requested": bool(args.resume),
+            "sample_ids_sha256": hashlib.sha256(cohort_bytes).hexdigest(),
+            "sample_ids": sample_ids,
+            "frame_preparation": args.frame_preparation,
+            "num_key_frames": (
+                config.num_key_frames
+                if args.frame_preparation == "spatial-agent"
+                else args.max_frames
+            ),
+            "image_max_long_edge": config.image_max_long_edge,
+            "reconstruct_backend": (
+                config.reconstruct_backend
+                if args.frame_preparation == "spatial-agent"
+                else None
+            ),
+            "record_input_fingerprints": record_input_fingerprints,
+            "model_config": args.model,
+            "model_config_sha256": _sha256_file(args.model),
+            "dataset_config": args.dataset,
+            "dataset_config_sha256": _sha256_file(args.dataset),
+            "policy_config": None,
+            "policy_config_sha256": None,
+            "effective_request_timeouts": effective_request_timeouts,
+            "effective_evaluation_config_sha256": (
+                _effective_evaluation_config_sha256(config)
+            ),
+            "sealed_git_head": sealed_git_head,
+            "source_tree_sha256": _source_tree_sha256(package_dir),
+        }
+
+    pred_file = os.path.join(config.work_dir, "predictions.jsonl")
+    input_manifest_file = os.path.join(config.work_dir, "input_manifest.jsonl")
+    if not args.resume:
+        if os.path.exists(pred_file):
+            os.remove(pred_file)
+        if os.path.exists(input_manifest_file):
+            os.remove(input_manifest_file)
+    if run_manifest is not None:
+        _establish_run_manifest(
+            config.work_dir,
+            run_manifest,
+            pred_file,
+            enforce_identity=True,
+        )
+    with open(os.path.join(config.work_dir, "config.json"), "w") as f:
+        json.dump(config.to_dict(), f, indent=2, default=str)
+
     print(f"Benchmark: {benchmark.__class__.__name__} ({len(benchmark)} samples)")
     print(f"Model: {config.llm_model}")
     print(f"Max frames per sample: {args.max_frames}")
+    print(f"Frame preparation: {args.frame_preparation}")
     print(f"General params: {config.general_params.to_dict()}")
     print(f"Concurrency: {config.concurrency}")
     print(f"Work dir: {config.work_dir}")
 
     # ── resume / fresh ──────────────────────────────────────────────────
-    pred_file = os.path.join(config.work_dir, "predictions.jsonl")
     completed_ids: set = set()
     if args.resume and os.path.exists(pred_file):
         with open(pred_file) as f:
@@ -300,9 +727,6 @@ async def main():
                 except Exception:
                     pass
         print(f"Resuming: {len(completed_ids)} samples already completed.")
-    elif not args.resume:
-        if os.path.exists(pred_file):
-            os.remove(pred_file)
 
     # ── LLM client ──────────────────────────────────────────────────────
     from spatial_agent.llm.client import LLMClient
@@ -334,10 +758,21 @@ async def main():
                 sample,
                 predictions,
                 pred_file,
+                input_manifest_file,
                 semaphore,
                 lock,
                 max_frames=args.max_frames,
                 max_long_edge=config.image_max_long_edge,
+                frame_preparation=args.frame_preparation,
+                num_key_frames=config.num_key_frames,
+                reconstruct_backend=config.reconstruct_backend,
+                record_input_fingerprints=record_input_fingerprints,
+                finalize_on_llm_timeout=bool(
+                    getattr(config, "finalize_on_llm_timeout", False)
+                ),
+                generation_timeout_sec=effective_request_timeouts[
+                    "vlm_request_timeout_sec"
+                ],
                 role_params=config.general_params,
                 system_prompt=active_prompt,
                 prompt_style=args.system_prompt,

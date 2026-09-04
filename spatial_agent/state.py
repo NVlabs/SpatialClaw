@@ -42,6 +42,13 @@ class VLMQuery(TypedDict):
     num_images: int  # how many images were sent
 
 
+class AnswerSchema(TypedDict):
+    """Controller-visible answer contract derived from choices, never from GT."""
+
+    kind: Literal["multiple_choice", "open"]
+    allowed_values: List[str]
+
+
 class StepResult(TypedDict):
     """Result of a single Jupyter cell execution."""
 
@@ -78,13 +85,23 @@ class AgentState(TypedDict):
     max_steps: int  # default 20
     max_failures: int  # default 5
     max_tool_calls: int  # default 50
+    no_progress_limit: int  # repeated identical action+outcome transitions
+    no_progress_count: int
+    soft_step_limit: int  # 0 disables the soft evidence-aware limit
+    reserve_final_answer_turn: bool
+    finalize_on_llm_timeout: bool
+    llm_generation_timed_out: bool
+    llm_generation_timeout_attempts: int
+    last_action_signature: Optional[str]
+    last_outcome_signature: Optional[str]
+    new_evidence_last_step: bool
 
     # --- Current step data -----------------------------------------------
     current_llm_response: Optional[Dict[str, str]]
     # parsed JSON: {purpose, reasoning, next_goal, code}
     current_step_result: Optional[StepResult]
     last_error_type: Optional[str]
-    # 'llm_call_failed' | 'json_validation_failed' | None
+    # 'llm_call_failed' | 'llm_generation_timeout' | 'validation_failed' | None
 
     # --- Kernel state ----------------------------------------------------
     kernel_id: Optional[str]
@@ -100,6 +117,18 @@ class AgentState(TypedDict):
     termination_reason: Optional[str]
     # 'completed' | 'max_steps' | 'max_failures' | 'max_tool_calls'
     plan: Optional[str]
+
+    # --- Model-specific answer controller -------------------------------
+    answer_schema: AnswerSchema
+    direct_candidate: Optional[str]
+    direct_candidate_raw: Optional[str]
+    proposed_answer: Optional[str]
+    evidence_count: int
+    evidence_summaries: List[str]
+    evidence_images: List[Any]
+    accepted_visual_evidence_fingerprints: List[str]
+    credited_inline_fingerprints: List[str]
+    # inline input images already credited as loop progress (never as evidence)
 
     # --- Verification checklist (active when enable_reflection=True) ------
     checklist: List[ChecklistItem]

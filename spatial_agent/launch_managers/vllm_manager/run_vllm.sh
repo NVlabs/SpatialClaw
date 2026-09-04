@@ -13,10 +13,11 @@ NUM_GPUS="$5"
 TP_SIZE="${6:-$NUM_GPUS}"
 KV_CACHE_DTYPE="${7:-auto}"
 QUANTIZATION="${8:-none}"
+MODEL_REVISION="${9:-}"
 
 if [ -z "$MODEL" ] || [ -z "$SERVED_NAME" ]; then
     echo "ERROR: Missing required arguments"
-    echo "Usage: $0 <model> <served_name> <max_model_len> <max_num_seqs> <num_gpus> [tp_size] [kv_cache_dtype] [quantization]"
+    echo "Usage: $0 <model> <served_name> <max_model_len> <max_num_seqs> <num_gpus> [tp_size] [kv_cache_dtype] [quantization] [model_revision]"
     exit 1
 fi
 
@@ -95,12 +96,47 @@ export PATH="$PWD/.venv/bin:$PATH"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
+# Preserve the manager-authenticated lifecycle envelope across private env
+# loading.  These values identify ownership/readiness only; they are not model
+# request parameters.  A local .env file must never be able to relabel a
+# managed allocation as another pool, slot, or specification.
+LIFECYCLE_POOL_ID="${SPATIAL_AGENT_SERVICE_POOL_ID:-}"
+LIFECYCLE_NAMESPACE="${SPATIAL_AGENT_SERVICE_NAMESPACE:-}"
+LIFECYCLE_SLOT_ID="${SPATIAL_AGENT_SERVICE_SLOT_ID:-}"
+LIFECYCLE_GENERATION="${SPATIAL_AGENT_SERVICE_GENERATION:-}"
+LIFECYCLE_SERVER_SPEC_DIGEST="${SPATIAL_AGENT_SERVER_SPEC_DIGEST:-}"
+LIFECYCLE_TOPOLOGY_DIGEST="${SPATIAL_AGENT_TOPOLOGY_DIGEST:-}"
+LIFECYCLE_STARTUP_TIMEOUT_SECONDS="${SPATIAL_AGENT_SERVICE_STARTUP_TIMEOUT_SECONDS:-}"
+readonly LIFECYCLE_POOL_ID LIFECYCLE_NAMESPACE LIFECYCLE_SLOT_ID
+readonly LIFECYCLE_GENERATION LIFECYCLE_SERVER_SPEC_DIGEST
+readonly LIFECYCLE_TOPOLOGY_DIGEST
+readonly LIFECYCLE_STARTUP_TIMEOUT_SECONDS
+
 # HF_TOKEN etc. live in .env.local (gitignored, chmod 600) — raises our HF API
 # rate-limit quota so tokenizer init doesn't 429 during restart bursts.
 if [ -f .env.local ]; then
     set -a
     . ./.env.local
     set +a
+fi
+
+# Lifecycle-managed services attest that synthetic work is disabled.  Enforce
+# that effective value *after* loading .env.local so an inherited/private env
+# cannot silently recreate reaper-evasion traffic or invalidate the pool spec.
+if [ -n "$LIFECYCLE_POOL_ID" ]; then
+    export SPATIAL_AGENT_SERVICE_POOL_ID="$LIFECYCLE_POOL_ID"
+    export SPATIAL_AGENT_SERVICE_NAMESPACE="$LIFECYCLE_NAMESPACE"
+    export SPATIAL_AGENT_SERVICE_SLOT_ID="$LIFECYCLE_SLOT_ID"
+    export SPATIAL_AGENT_SERVICE_GENERATION="$LIFECYCLE_GENERATION"
+    export SPATIAL_AGENT_SERVER_SPEC_DIGEST="$LIFECYCLE_SERVER_SPEC_DIGEST"
+    export SPATIAL_AGENT_TOPOLOGY_DIGEST="$LIFECYCLE_TOPOLOGY_DIGEST"
+    export SPATIAL_AGENT_SERVICE_STARTUP_TIMEOUT_SECONDS="$LIFECYCLE_STARTUP_TIMEOUT_SECONDS"
+    export SPATIAL_AGENT_ENABLE_SYNTHETIC_KEEPALIVE=0
+else
+    unset SPATIAL_AGENT_SERVICE_POOL_ID SPATIAL_AGENT_SERVICE_NAMESPACE
+    unset SPATIAL_AGENT_SERVICE_SLOT_ID SPATIAL_AGENT_SERVICE_GENERATION
+    unset SPATIAL_AGENT_SERVER_SPEC_DIGEST SPATIAL_AGENT_TOPOLOGY_DIGEST
+    unset SPATIAL_AGENT_SERVICE_STARTUP_TIMEOUT_SECONDS
 fi
 
 echo "Model: $MODEL"
@@ -111,12 +147,20 @@ echo "Number of GPUs: $NUM_GPUS"
 echo "Tensor parallel size: $TP_SIZE"
 echo "KV cache dtype: $KV_CACHE_DTYPE"
 echo "Quantization: $QUANTIZATION"
+if [ -n "$MODEL_REVISION" ]; then
+    echo "Model revision: $MODEL_REVISION"
+fi
 echo "========================================"
 
 # Start vLLM server
 echo "Starting vLLM server..."
+REVISION_ARGS=()
+if [ -n "$MODEL_REVISION" ]; then
+    REVISION_ARGS+=(--revision "$MODEL_REVISION")
+fi
 stdbuf -oL -eL .venv/bin/python -u -m spatial_agent.entrypoints.launch_vllm \
     --model "$MODEL" \
+    "${REVISION_ARGS[@]}" \
     --served_model_name "$SERVED_NAME" \
     --tp "$TP_SIZE" \
     --kv_cache_dtype "$KV_CACHE_DTYPE" \

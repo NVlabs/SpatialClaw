@@ -4,12 +4,13 @@ import ast
 import json
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from langchain_core.runnables import RunnableConfig
 from PIL import Image
 
 from spatial_agent.kernel.safety import SecuritySandbox
+from spatial_agent.llm.answer_policy import allowed_values
 from spatial_agent.state import AgentState
 
 
@@ -18,6 +19,20 @@ from spatial_agent.state import AgentState
 # ---------------------------------------------------------------------------
 
 _SHOW_RE = re.compile(r"^\[SHOW:(\{.*\})\]$", re.MULTILINE)
+
+
+def _log_step_fail_open(
+    session_logger: Any,
+    session_id: str,
+    record: Dict[str, Any],
+) -> None:
+    """Emit execution telemetry without letting logger I/O affect a sample."""
+    if session_logger is None:
+        return
+    try:
+        session_logger.log_step(session_id, record)
+    except Exception:
+        pass
 
 
 def _effective_cell_timeout(configured_timeout: float) -> float:
@@ -95,6 +110,75 @@ def _extract_show_labels(code: str) -> List[str]:
     return labels
 
 
+def _normalize_answer_symbols(
+    code: str,
+    allowed_symbols: Iterable[str],
+    known_names: Iterable[str] = (),
+) -> str:
+    """Quote schema labels in standalone ``ReturnAnswer(Name)`` calls.
+
+    Replacements use AST source positions rather than regexes, so strings,
+    comments, member calls, and nested calls remain byte-for-byte unchanged.
+    A name that exists in the current cell or a previous kernel cell is a real
+    variable and must not be converted into a label.
+    """
+    allowed = {str(value).strip().upper() for value in allowed_symbols}
+    if not allowed:
+        return code
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    assigned = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+    protected = assigned | {str(name) for name in known_names}
+    replacements = []
+    for statement in tree.body:
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+            continue
+        call = statement.value
+        if not isinstance(call.func, ast.Name) or call.func.id != "ReturnAnswer":
+            continue
+        if len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Name):
+            continue
+        symbol = call.args[0].id
+        if symbol.upper() not in allowed or symbol in protected:
+            continue
+        arg = call.args[0]
+        replacements.append((
+            arg.lineno,
+            arg.col_offset,
+            arg.end_lineno,
+            arg.end_col_offset,
+            f'"{symbol.upper()}"',
+        ))
+
+    if not replacements:
+        return code
+
+    # CPython AST columns are UTF-8 byte offsets. Convert them to character
+    # offsets before slicing so non-ASCII comments or literals are safe.
+    lines = code.splitlines(keepends=True)
+
+    def _offset(line_no: int, byte_col: int) -> int:
+        prefix = sum(len(line) for line in lines[: line_no - 1])
+        line = lines[line_no - 1]
+        char_col = len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+        return prefix + char_col
+
+    rewritten = code
+    spans = [
+        (_offset(start_line, start_col), _offset(end_line, end_col), value)
+        for start_line, start_col, end_line, end_col, value in replacements
+    ]
+    for start, end, value in sorted(spans, reverse=True):
+        rewritten = rewritten[:start] + value + rewritten[end:]
+    return rewritten
+
+
 async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """Execute the LLM-generated code in the Jupyter kernel.
 
@@ -134,6 +218,25 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
 
     code = llm_response["code"]
 
+    # Opt-in protocol fix: rewrite bare-name answer submissions such as
+    # ``ReturnAnswer(A)`` to ``ReturnAnswer("A")``. Without this, the call
+    # raises NameError and weak backbones burn their remaining steps instead
+    # of submitting. Skipped when the letter is actually assigned in the cell.
+    if getattr(agent_config, "normalize_answer_symbols", False):
+        normalized_code = _normalize_answer_symbols(
+            code,
+            allowed_values(state.get("answer_schema")),
+            state.get("variable_registry", {}).keys(),
+        )
+        if normalized_code != code:
+            _log_step_fail_open(logger, state["session_id"], {
+                "event_type": "answer_symbol_normalized",
+                "step_index": state["step_count"],
+                "original_code": code,
+                "normalized_code": normalized_code,
+            })
+            code = normalized_code
+
     # 1. Security check
     safety_error = SecuritySandbox.check(code)
     if safety_error:
@@ -149,13 +252,12 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
             "tool_call_count": 0,
             "execution_time_sec": 0.0,
         }
-        if logger:
-            logger.log_step(state["session_id"], {
-                "event_type": "execution",
-                "step_index": state["step_count"],
-                "code": code,
-                "error": safety_error,
-            })
+        _log_step_fail_open(logger, state["session_id"], {
+            "event_type": "execution",
+            "step_index": state["step_count"],
+            "code": code,
+            "error": safety_error,
+        })
         return {"current_step_result": step_result}
 
     # 2. Clear feedback/vlm query buffers before execution
@@ -295,11 +397,11 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
         "execution_time_sec": result.execution_time_sec,
     }
 
-    if logger:
+    if logger is not None:
         _ansi_re = re.compile(r"\x1b\[[0-9;]*m")
         locate_count = sum(1 for q in vlm_queries if q.get("query_type") == "locate")
         thinking_count = sum(1 for q in vlm_queries if q.get("query_type") == "thinking")
-        logger.log_step(state["session_id"], {
+        _log_step_fail_open(logger, state["session_id"], {
             "event_type": "execution",
             "step_index": state["step_count"],
             "code": code,

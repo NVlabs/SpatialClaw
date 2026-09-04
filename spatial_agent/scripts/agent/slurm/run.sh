@@ -12,6 +12,7 @@ MODEL_CONFIG="${3:-}"
 DATASET_CONFIG="${4:-}"
 EXPERIMENT_NAME="${5:-}"
 SUBSAMPLE="${6:-0}"
+GENERATION_SEED="${7:-}"
 
 if [ -z "$BENCHMARK" ]; then
     echo "ERROR: Benchmark not specified"
@@ -57,13 +58,16 @@ if [ -n "$EXPERIMENT_NAME" ]; then
     # Mirror run.py's default work_dir layout.
     MODEL_SHORT="unknown"
     if [ -n "$MODEL_CONFIG" ] && [ -f "$MODEL_CONFIG" ]; then
-        MODEL_SHORT=$(python3 -c "import json; print(json.load(open('$MODEL_CONFIG'))['llm_model'].split('/')[-1][:30])" 2>/dev/null || echo "unknown")
+        MODEL_SHORT=$(python3 -c "import json; c=json.load(open('$MODEL_CONFIG')); print(c.get('model_profile') or c['llm_model'].split('/')[-1][:30])" 2>/dev/null || echo "unknown")
     fi
     WORK_DIR="spatial_agent/work_dir/spatial_${BENCHMARK}_${MODEL_SHORT}_${EXPERIMENT_NAME}"
     CMD+=" --work_dir ${WORK_DIR}"
 fi
 if [ "$SUBSAMPLE" -gt 0 ] 2>/dev/null; then
     CMD+=" --subsample $SUBSAMPLE"
+fi
+if [[ "$GENERATION_SEED" =~ ^-?[0-9]+$ ]]; then
+    CMD+=" --seed $GENERATION_SEED"
 fi
 
 # Run the agent with resume flag

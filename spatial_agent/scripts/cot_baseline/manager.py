@@ -17,10 +17,33 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from termcolor import colored
+
+
+def _write_unique_sbatch(
+    output_dir: Path, job_name: str, script_content: str,
+) -> Path:
+    """Create one private batch artifact without a truncating name race."""
+    fd, raw_path = tempfile.mkstemp(
+        prefix=f"{job_name}_", suffix=".sbatch", dir=output_dir,
+    )
+    script_path = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(script_content)
+        script_path.chmod(0o755)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        script_path.unlink(missing_ok=True)
+        raise
+    return script_path
 
 
 class SlurmCoTManager:
@@ -285,13 +308,10 @@ echo "=========================================="
     def submit_job(self) -> bool:
         print(colored(f"[{self._ts()}] Submitting job #{self.job_counter}...", "cyan"), flush=True)
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        script_path = self.output_dir / f"{self.job_name}_{timestamp}.sbatch"
-
         script_content = self._generate_slurm_script(self.job_counter)
-        with open(script_path, "w") as f:
-            f.write(script_content)
-        script_path.chmod(0o755)
+        script_path = _write_unique_sbatch(
+            self.output_dir, self.job_name, script_content,
+        )
 
         cmd = ["sbatch", str(script_path)]
         result = subprocess.run(cmd, capture_output=True, text=True)

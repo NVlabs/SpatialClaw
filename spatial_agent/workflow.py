@@ -1,6 +1,7 @@
 """Main workflow: builds the LangGraph and runs the agent."""
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -23,14 +24,80 @@ from spatial_agent.llm.vision_prompt import (
 )
 from spatial_agent.logging_utils.logger import SessionLogger
 from spatial_agent.nodes.execute_node import execute_node
-from spatial_agent.nodes.feedback_node import feedback_node
+from spatial_agent.nodes.feedback_node import feedback_node, visual_fingerprint
+from spatial_agent.nodes.answer_policy_node import (
+    answer_gate_node,
+    direct_answer_node,
+    final_answer_node,
+)
 from spatial_agent.nodes.init_node import init_node
 from spatial_agent.nodes.llm_step_node import llm_step_node
 from spatial_agent.nodes.plan_node import plan_node
 from spatial_agent.nodes.reflection_node import reflection_node
-from spatial_agent.nodes.router import force_terminate, should_continue
+from spatial_agent.nodes.router import (
+    after_direct_answer,
+    after_plan,
+    force_terminate,
+    should_continue,
+)
 from spatial_agent.state import AgentState
 from spatial_agent.tools import ToolsModule
+
+
+def _input_fingerprint_evidence(
+    *, key_frames, key_frame_video_idx, key_frame_list_indices,
+    key_frame_indices, loaded_ref_images, video_source,
+    video_sources_per_video,
+) -> Dict[str, Any]:
+    """Build result-neutral visual-input evidence without escaping failures."""
+    try:
+        key_frame_fingerprints = []
+        for pos, image in enumerate(key_frames):
+            key_frame_fingerprints.append({
+                "context_position": pos,
+                "video_index": (
+                    key_frame_video_idx[pos]
+                    if pos < len(key_frame_video_idx) else 0
+                ),
+                "local_index": (
+                    key_frame_list_indices[pos]
+                    if pos < len(key_frame_list_indices) else pos
+                ),
+                "frame_index": (
+                    key_frame_indices[pos]
+                    if pos < len(key_frame_indices) else pos
+                ),
+                "mode": image.mode,
+                "size": list(image.size),
+                "rgb_sha256": hashlib.sha256(
+                    image.convert("RGB").tobytes()
+                ).hexdigest(),
+            })
+        reference_fingerprints = [{
+            "reference_index": pos,
+            "mode": image.mode,
+            "size": list(image.size),
+            "rgb_sha256": hashlib.sha256(
+                image.convert("RGB").tobytes()
+            ).hexdigest(),
+        } for pos, image in enumerate(loaded_ref_images)]
+        return {
+            "evidence_schema_version": 1,
+            "fingerprint_valid": True,
+            "video_source": video_source,
+            "video_sources": video_sources_per_video or [],
+            "key_frames": key_frame_fingerprints,
+            "reference_images": reference_fingerprints,
+        }
+    except Exception as exc:
+        return {
+            "evidence_schema_version": 1,
+            "fingerprint_valid": False,
+            "evidence_error": {
+                "stage": "input_fingerprint",
+                "exception_type": type(exc).__name__,
+            },
+        }
 
 
 class KernelPool:
@@ -130,28 +197,49 @@ class SpatialAgentWorkflow:
         graph = StateGraph(AgentState)
 
         graph.add_node("init_node", init_node)
+        graph.add_node("direct_answer_node", direct_answer_node)
         graph.add_node("plan_node", plan_node)
         graph.add_node("llm_step_node", llm_step_node)
         graph.add_node("execute_node", execute_node)
         graph.add_node("feedback_node", feedback_node)
+        graph.add_node("answer_gate_node", answer_gate_node)
         graph.add_node("reflection_node", reflection_node)
+        graph.add_node("final_answer_node", final_answer_node)
         graph.add_node("force_terminate", force_terminate)
 
         graph.set_entry_point("init_node")
-        graph.add_edge("init_node", "plan_node")
-        graph.add_edge("plan_node", "llm_step_node")
+        graph.add_edge("init_node", "direct_answer_node")
+        graph.add_conditional_edges(
+            "direct_answer_node",
+            after_direct_answer,
+            {
+                "plan_node": "plan_node",
+                "final_answer_node": "final_answer_node",
+            },
+        )
+        graph.add_conditional_edges(
+            "plan_node",
+            after_plan,
+            {
+                "llm_step_node": "llm_step_node",
+                "final_answer_node": "final_answer_node",
+            },
+        )
         graph.add_edge("llm_step_node", "execute_node")
         graph.add_edge("execute_node", "feedback_node")
-        graph.add_edge("feedback_node", "reflection_node")
+        graph.add_edge("feedback_node", "answer_gate_node")
+        graph.add_edge("answer_gate_node", "reflection_node")
         graph.add_conditional_edges(
             "reflection_node",
             should_continue,
             {
                 "llm_step_node": "llm_step_node",
+                "final_answer_node": "final_answer_node",
                 "force_terminate": "force_terminate",
                 END: END,
             },
         )
+        graph.add_edge("final_answer_node", END)
         graph.add_edge("force_terminate", END)
 
         return graph.compile()
@@ -175,6 +263,7 @@ class SpatialAgentWorkflow:
         video_names: Optional[List[str]] = None,
         video_sources_per_video: Optional[List[str]] = None,
         ref_images: Optional[List] = None,
+        answer_schema: Optional[Dict[str, Any]] = None,
         defer_report: bool = False,
     ) -> Dict[str, Any]:
         """Run the agent on a single sample.
@@ -275,6 +364,33 @@ class SpatialAgentWorkflow:
                     from spatial_agent.gpu_models.image_resize import resize_for_input_images_for_backend
                     img = resize_for_input_images_for_backend(img, max_edge, backend)
                 loaded_ref_images.append(img)
+
+        # Exact-pixel provenance for overlap-matched comparisons. Hash only
+        # images actually supplied to the controller/main model.
+        input_fingerprint = {
+            "evidence_schema_version": 1,
+            "fingerprint_valid": False,
+        }
+        if getattr(self.config, "record_input_fingerprints", False):
+            input_fingerprint = _input_fingerprint_evidence(
+                key_frames=key_frames,
+                key_frame_video_idx=key_frame_video_idx,
+                key_frame_list_indices=key_frame_list_indices,
+                key_frame_indices=key_frame_indices,
+                loaded_ref_images=loaded_ref_images,
+                video_source=video_source,
+                video_sources_per_video=video_sources_per_video,
+            )
+
+        initial_key_frame_fingerprints = []
+        if getattr(
+            self.config, "require_novel_visual_override_evidence", False
+        ):
+            initial_key_frame_fingerprints = [
+                fingerprint
+                for image in key_frames
+                if (fingerprint := visual_fingerprint(image)) is not None
+            ]
 
         # Build InputImages with lazy loading (images load on first access).
         # In multi-video mode we build one InputImages per video; the workflow
@@ -391,6 +507,7 @@ class SpatialAgentWorkflow:
                 key_frame_list_indices=key_frame_list_indices or None,
                 key_frame_video_idx=key_frame_video_idx or None,
                 num_ref_images=len(loaded_ref_images),
+                config=self.config,
             )
 
         km = await self._kernel_pool.acquire()
@@ -406,14 +523,41 @@ class SpatialAgentWorkflow:
             "max_steps": self.config.max_steps,
             "max_failures": self.config.max_failures,
             "max_tool_calls": self.config.max_tool_calls,
+            "no_progress_limit": getattr(self.config, "no_progress_limit", 0),
+            "no_progress_count": 0,
+            "soft_step_limit": getattr(self.config, "soft_step_limit", 0),
+            "reserve_final_answer_turn": getattr(
+                self.config, "reserve_final_answer_turn", False
+            ),
+            "finalize_on_llm_timeout": getattr(
+                self.config, "finalize_on_llm_timeout", False
+            ),
+            "llm_generation_timed_out": False,
+            "llm_generation_timeout_attempts": 0,
+            "last_action_signature": None,
+            "last_outcome_signature": None,
+            "new_evidence_last_step": False,
             "current_llm_response": None,
             "current_step_result": None,
             "last_error_type": None,
             "kernel_id": None,
             "variable_registry": {},
             "final_answer": None,
+            "last_submitted_answer": None,
             "termination_reason": None,
             "plan": None,
+            "answer_schema": answer_schema or {
+                "kind": "open",
+                "allowed_values": [],
+            },
+            "direct_candidate": None,
+            "direct_candidate_raw": None,
+            "proposed_answer": None,
+            "evidence_count": 0,
+            "evidence_summaries": [],
+            "evidence_images": [],
+            "accepted_visual_evidence_fingerprints": [],
+            "credited_inline_fingerprints": [],
             "checklist": [],
             "answer_block_count": 0,
             "total_answer_attempts": 0,
@@ -438,6 +582,7 @@ class SpatialAgentWorkflow:
                 "input_images_list": input_images_list if is_multi_video else None,
                 "metadata_obj": metadata,
                 "key_frames": key_frames,
+                "initial_key_frame_fingerprints": initial_key_frame_fingerprints,
                 "key_frame_indices": key_frame_indices,
                 "key_frame_list_indices": key_frame_list_indices,
                 "key_frame_video_idx": key_frame_video_idx,
@@ -475,9 +620,13 @@ class SpatialAgentWorkflow:
         return {
             "final_answer": final_state.get("final_answer"),
             "termination_reason": final_state.get("termination_reason"),
+            "llm_generation_timeout_attempts": final_state.get(
+                "llm_generation_timeout_attempts", 0
+            ),
             "step_count": final_state.get("step_count", 0),
             "total_tool_calls": final_state.get("total_tool_calls", 0),
             "usage": usage,
+            "input_fingerprint": input_fingerprint,
             "_report_context": {
                 "session_dir": session_dir,
                 "instruction": instruction,

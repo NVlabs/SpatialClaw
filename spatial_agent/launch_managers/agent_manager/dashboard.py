@@ -105,15 +105,7 @@ class Dashboard:
         self.console = Console()
 
     def render(self) -> None:
-        """Render the full experiment dashboard."""
-        # Clean up dead chains
-        dead = self.state_manager.cleanup_dead_experiments()
-        if dead:
-            for d in dead:
-                self.console.print(
-                    f"[dim]Cleaned up dead experiment: {d.benchmark}/{d.experiment_name} (PID {d.pid})[/dim]"
-                )
-
+        """Render the full experiment dashboard without mutating state."""
         experiments = self.state_manager.list_experiments()
 
         if not experiments:
@@ -140,19 +132,58 @@ class Dashboard:
                 all_job_ids.add(parent_jid)
         job_info_map = batch_query_jobs(list(all_job_ids)) if all_job_ids else {}
 
-        # Separate active and completed experiments. Completed/failed entries
-        # are shown once and then removed from state so they don't accumulate.
+        # Rendering is deliberately read-only. Cleanup/recovery requires fresh
+        # scheduler and lifecycle authority and belongs to explicit CLI flows.
         active_exps = [e for e in experiments if e.status == "running"]
         completed_exps = [e for e in experiments if e.status in ("completed", "failed")]
+        deferred_exps = [
+            e for e in experiments
+            if e.status == "queue_deferred_retry_required"
+        ]
 
         if active_exps:
             self._render_active_table(active_exps, job_info_map, overlay_by_pid)
 
         if completed_exps:
             self._render_completed_table(completed_exps)
-            self.state_manager.remove_experiments(
-                [e.experiment_id for e in completed_exps]
+
+        if deferred_exps:
+            self._render_deferred_table(deferred_exps)
+
+    def _render_deferred_table(self, experiments: List[ExperimentState]) -> None:
+        """Render result-preserving queue deferrals as explicitly non-active."""
+        table = Table(
+            title="Deferred Experiments — Manual Resume Required",
+            title_style="bold yellow",
+            border_style="yellow",
+            show_lines=True,
+            padding=(0, 1),
+        )
+        table.add_column("Type", style="magenta", width=6, justify="center")
+        table.add_column("Benchmark", style="bold white", min_width=14)
+        table.add_column("Model", style="white", min_width=16)
+        table.add_column("Experiment", style="cyan", min_width=14)
+        table.add_column("Status", min_width=14, justify="center")
+        table.add_column("Progress", min_width=16, justify="center")
+        table.add_column("Work Dir", style="dim", min_width=24)
+        table.add_column("Next Action", min_width=28)
+
+        for exp in experiments:
+            completed = count_predictions(exp.work_dir)
+            progress = self._format_progress(completed, exp.total_samples)
+            table.add_row(
+                "CoT" if exp.experiment_type == "cot" else "Agent",
+                exp.benchmark,
+                exp.model_name,
+                exp.experiment_name,
+                Text("QUEUE DEFERRED", style="bold yellow"),
+                progress,
+                exp.work_dir or "-",
+                "Relaunch manually to resume; no automatic retry.",
             )
+
+        self.console.print(table)
+        self.console.print()
 
     def _render_active_table(
         self,

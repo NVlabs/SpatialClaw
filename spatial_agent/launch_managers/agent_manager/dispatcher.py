@@ -15,13 +15,23 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 
 from spatial_agent.launch_managers.agent_manager.state import FileLock
+from spatial_agent.launch_managers.lifecycle import (
+    collision_safe_token,
+    format_evaluator_step_name,
+    process_identity,
+    process_identity_is_valid,
+    process_identity_record_is_recognized,
+    process_pid_is_valid,
+    process_record_alive,
+)
 from spatial_agent.launch_managers.slurm_utils import get_user_jobs_snapshot
 
 
@@ -54,6 +64,26 @@ _RESERVATION_BASENAME = "agent_reservations.json"
 _GPU_SERVER_REGISTRY = "gpu_server.json"
 _VLLM_SERVE_REGISTRY = "serve.json"
 
+_MANAGED_OVERLAY_ENV_KEYS = frozenset({
+    "SPATIAL_AGENT_LEASE_ID",
+    "SPATIAL_AGENT_COHORT_ID",
+    "SPATIAL_AGENT_OWNER_ID",
+    "SPATIAL_AGENT_WORKLOAD_POLICY_DIGEST",
+    "SPATIAL_AGENT_SERVICE_MANIFEST_DIGEST",
+    "SPATIAL_AGENT_VLLM_POOL_ID",
+    "SPATIAL_AGENT_VLLM_NAMESPACE",
+    "SPATIAL_AGENT_VLLM_SERVER_SPEC_DIGEST",
+    "SPATIAL_AGENT_VLLM_TOPOLOGY_DIGEST",
+    "SPATIAL_AGENT_VLLM_SLOT_ALLOWLIST",
+    "SPATIAL_AGENT_VLLM_ENDPOINT_ALLOWLIST",
+    "SPATIAL_AGENT_TOOL_POOL_ID",
+    "SPATIAL_AGENT_TOOL_NAMESPACE",
+    "SPATIAL_AGENT_TOOL_SPEC_DIGEST",
+    "SPATIAL_AGENT_TOOL_TOPOLOGY_DIGEST",
+    "SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST",
+    "SPATIAL_AGENT_GPU_SERVER_UID_ALLOWLIST",
+})
+
 
 # ---------------------------------------------------------------------------
 # Datatypes
@@ -67,6 +97,7 @@ class AgentSlot:
     concurrency_gb: int
     pid: int
     started_at: float
+    process_identity: Optional[dict] = None
 
 
 @dataclass
@@ -82,9 +113,30 @@ class OverlayHost:
         return (PER_GPU_TOTAL_GB - PER_GPU_RESERVED_GB) * self.gpus
 
 
+@dataclass(frozen=True)
+class _ManagedPoolAuthority:
+    kind: str
+    pool_id: str
+    namespace: str
+    spec_digest: str
+    topology_digest: str
+    slots: FrozenSet[str]
+
+
+@dataclass(frozen=True)
+class _ManagedOverlayAuthority:
+    lease_id: str
+    vllm: _ManagedPoolAuthority
+    tools: Optional[_ManagedPoolAuthority]
+
+
 # ---------------------------------------------------------------------------
 # Reservation file helpers
 # ---------------------------------------------------------------------------
+
+
+class ReservationStateError(RuntimeError):
+    """Overlay ownership authority is corrupt, unreadable, or uncertain."""
 
 
 def _reservation_paths(project_root: Path) -> Tuple[Path, str]:
@@ -101,22 +153,76 @@ def _load_reservations(state_file: Path) -> Dict[str, List[AgentSlot]]:
     try:
         with open(state_file, "r") as f:
             raw = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError, OSError):
-        return {}
+    except (json.JSONDecodeError, FileNotFoundError, OSError) as exc:
+        raise ReservationStateError(
+            f"Overlay reservation authority is unreadable: {state_file}: {exc}"
+        ) from exc
     out: Dict[str, List[AgentSlot]] = {}
     if not isinstance(raw, dict):
-        return {}
+        raise ReservationStateError(
+            f"Overlay reservation authority root is not an object: {state_file}"
+        )
     for jid, slots in raw.items():
         if not isinstance(slots, list):
-            continue
+            raise ReservationStateError(
+                f"Overlay reservation bucket {jid!r} is not a list"
+            )
         valid: List[AgentSlot] = []
         for s in slots:
             if not isinstance(s, dict):
-                continue
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} is not an object"
+                )
+            raw_identity = s.get("process_identity")
+            if raw_identity is not None and not isinstance(raw_identity, dict):
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} has malformed "
+                    "process identity"
+                )
+            raw_pid = s.get("pid")
+            if not process_pid_is_valid(raw_pid):
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} has invalid PID"
+                )
             try:
-                valid.append(AgentSlot(**s))
-            except TypeError:
-                continue
+                slot = AgentSlot(
+                    slot_id=str(s["slot_id"]),
+                    jobid=str(s["jobid"]),
+                    concurrency_gb=int(s["concurrency_gb"]),
+                    pid=raw_pid,
+                    started_at=float(s["started_at"]),
+                    process_identity=(
+                        dict(raw_identity)
+                        if isinstance(raw_identity, dict)
+                        else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} is malformed"
+                ) from exc
+            if (
+                not slot.slot_id
+                or not slot.jobid
+                or slot.jobid != str(jid)
+                or slot.concurrency_gb <= 0
+                or slot.pid <= 0
+                or slot.started_at <= 0
+            ):
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} has invalid values"
+                )
+            if (
+                slot.process_identity is not None
+                and not process_identity_record_is_recognized(
+                slot.process_identity, expected_pid=slot.pid,
+                )
+            ):
+                raise ReservationStateError(
+                    f"Overlay reservation in bucket {jid!r} has invalid "
+                    "process identity"
+                )
+            valid.append(slot)
         if valid:
             out[str(jid)] = valid
     return out
@@ -126,10 +232,35 @@ def _save_reservations(
     state_file: Path, reservations: Dict[str, List[AgentSlot]]
 ) -> None:
     serial = {jid: [asdict(s) for s in slots] for jid, slots in reservations.items() if slots}
-    tmp = state_file.parent / (state_file.name + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(serial, f, indent=2)
-    os.replace(tmp, state_file)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{state_file.name}.", suffix=".tmp", dir=state_file.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(serial, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, state_file)
+        temporary = ""
+        directory_fd = os.open(
+            state_file.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +313,128 @@ def _seconds_left(time_limit: str, elapsed: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
+def _required_env_value(environ: Mapping[str, str], name: str) -> str:
+    value = str(environ.get(name) or "").strip()
+    if not value:
+        raise ReservationStateError(
+            f"Managed overlay authority is missing {name}"
+        )
+    return value
+
+
+def _slot_allowlist(
+    environ: Mapping[str, str], name: str, *, require_nonempty: bool,
+) -> FrozenSet[str]:
+    if name not in environ:
+        raise ReservationStateError(
+            f"Managed overlay authority is missing {name}"
+        )
+    try:
+        raw = json.loads(environ[name])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ReservationStateError(
+            f"Managed overlay authority has malformed {name}"
+        ) from exc
+    if not isinstance(raw, list) or any(
+        not isinstance(slot, str) or not slot.strip() for slot in raw
+    ):
+        raise ReservationStateError(
+            f"Managed overlay authority has malformed {name}"
+        )
+    normalized = [slot.strip() for slot in raw]
+    if len(set(normalized)) != len(normalized):
+        raise ReservationStateError(
+            f"Managed overlay authority has duplicate slots in {name}"
+        )
+    if require_nonempty and not normalized:
+        raise ReservationStateError(
+            f"Managed overlay authority has an empty {name}"
+        )
+    return frozenset(normalized)
+
+
+def _managed_overlay_authority(
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[_ManagedOverlayAuthority]:
+    """Parse the frozen manifest envelope, or return legacy mode.
+
+    Any lifecycle field opts into managed parsing. Partial/malformed managed
+    context is never reinterpreted as permission for broad legacy discovery.
+    """
+    env = os.environ if environ is None else environ
+    if not any(name in env for name in _MANAGED_OVERLAY_ENV_KEYS):
+        return None
+
+    lease_id = _required_env_value(env, "SPATIAL_AGENT_LEASE_ID")
+    for name in (
+        "SPATIAL_AGENT_COHORT_ID",
+        "SPATIAL_AGENT_OWNER_ID",
+        "SPATIAL_AGENT_WORKLOAD_POLICY_DIGEST",
+        "SPATIAL_AGENT_SERVICE_MANIFEST_DIGEST",
+    ):
+        _required_env_value(env, name)
+
+    vllm = _ManagedPoolAuthority(
+        kind="vllm",
+        pool_id=_required_env_value(env, "SPATIAL_AGENT_VLLM_POOL_ID"),
+        namespace=_required_env_value(
+            env, "SPATIAL_AGENT_VLLM_NAMESPACE"
+        ),
+        spec_digest=_required_env_value(
+            env, "SPATIAL_AGENT_VLLM_SERVER_SPEC_DIGEST"
+        ),
+        topology_digest=_required_env_value(
+            env, "SPATIAL_AGENT_VLLM_TOPOLOGY_DIGEST"
+        ),
+        slots=_slot_allowlist(
+            env, "SPATIAL_AGENT_VLLM_SLOT_ALLOWLIST",
+            require_nonempty=True,
+        ),
+    )
+
+    tool_names = (
+        "SPATIAL_AGENT_TOOL_POOL_ID",
+        "SPATIAL_AGENT_TOOL_NAMESPACE",
+        "SPATIAL_AGENT_TOOL_SPEC_DIGEST",
+        "SPATIAL_AGENT_TOOL_TOPOLOGY_DIGEST",
+    )
+    if any(name not in env for name in tool_names):
+        raise ReservationStateError(
+            "Managed overlay authority is missing the tool-pool envelope"
+        )
+    tool_values = [str(env.get(name) or "").strip() for name in tool_names]
+    tool_slots = _slot_allowlist(
+        env, "SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST",
+        require_nonempty=False,
+    )
+    if any(tool_values) and not all(tool_values):
+        raise ReservationStateError(
+            "Managed overlay authority has a partial tool-pool identity"
+        )
+    if not any(tool_values):
+        if tool_slots:
+            raise ReservationStateError(
+                "Managed overlay authority declares tool slots without a pool"
+            )
+        tools = None
+    else:
+        if not tool_slots:
+            raise ReservationStateError(
+                "Managed overlay authority has an empty tool slot allowlist"
+            )
+        tools = _ManagedPoolAuthority(
+            kind="gpu_server",
+            pool_id=tool_values[0],
+            namespace=tool_values[1],
+            spec_digest=tool_values[2],
+            topology_digest=tool_values[3],
+            slots=tool_slots,
+        )
+    return _ManagedOverlayAuthority(
+        lease_id=lease_id, vllm=vllm, tools=tools,
+    )
+
+
 def _read_json_safe(path: Path):
     """Read JSON file, return None on any error."""
     if not path.exists():
@@ -191,6 +444,21 @@ def _read_json_safe(path: Path):
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def _read_managed_registry(path: Path) -> Dict[str, object]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+        raise ReservationStateError(
+            f"Managed overlay registry is unreadable: {path}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ReservationStateError(
+            f"Managed overlay registry root is not an object: {path}"
+        )
+    return value
 
 
 def _build_jobid_meta_map(project_root: Path) -> Dict[str, Tuple[str, int]]:
@@ -248,6 +516,117 @@ def _build_jobid_meta_map(project_root: Path) -> Dict[str, Tuple[str, int]]:
     return meta
 
 
+def _managed_record(
+    entry: object,
+    authority: _ManagedPoolAuthority,
+    *,
+    spec_field: str,
+) -> Optional[Tuple[int, str, int, str]]:
+    """Return (generation, job ID, GPU count, slot), or reject the record."""
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("pool_id") != authority.pool_id:
+        return None
+    if entry.get("namespace") != authority.namespace:
+        return None
+    if entry.get(spec_field) != authority.spec_digest:
+        return None
+    if entry.get("topology_digest") != authority.topology_digest:
+        return None
+    slot_id = str(entry.get("slot_id") or "")
+    if slot_id not in authority.slots:
+        return None
+    if str(entry.get("state") or "").lower() not in {"ready", "accepting"}:
+        return None
+    if entry.get("accepting") is not True or entry.get("draining"):
+        return None
+    job_id = str(entry.get("slurm_job_id") or "")
+    if not job_id:
+        return None
+    raw_generation = entry.get("generation")
+    if isinstance(raw_generation, bool):
+        return None
+    try:
+        generation = int(raw_generation)
+    except (TypeError, ValueError):
+        return None
+    if generation < 1:
+        return None
+    if authority.kind == "vllm":
+        gpus_field = entry.get("gpus")
+        gpus = len(gpus_field) if isinstance(gpus_field, list) else 0
+        if not gpus:
+            try:
+                gpus = int(entry.get("tp") or 0)
+            except (TypeError, ValueError):
+                gpus = 0
+    else:
+        try:
+            gpus = int(entry.get("num_gpus") or 0)
+        except (TypeError, ValueError):
+            gpus = 0
+    if gpus <= 0:
+        return None
+    return generation, job_id, gpus, slot_id
+
+
+def _build_managed_jobid_meta_map(
+    project_root: Path, authority: _ManagedOverlayAuthority,
+) -> Dict[str, Tuple[str, int]]:
+    """Build candidates only from the lease's frozen manifest envelope."""
+    log_dir = project_root.joinpath(*_LOG_DIR_NAME)
+    selected: Dict[Tuple[str, str], Tuple[int, str, int]] = {}
+    ambiguous: Set[Tuple[str, str]] = set()
+
+    def consider(
+        entry: object, pool: _ManagedPoolAuthority, spec_field: str,
+    ) -> None:
+        candidate = _managed_record(
+            entry, pool, spec_field=spec_field,
+        )
+        if candidate is None:
+            return
+        generation, job_id, gpus, slot_id = candidate
+        key = (pool.kind, slot_id)
+        previous = selected.get(key)
+        if previous is None or generation > previous[0]:
+            selected[key] = (generation, job_id, gpus)
+            ambiguous.discard(key)
+        elif generation == previous[0] and (
+            job_id != previous[1] or gpus != previous[2]
+        ):
+            # Two physical allocations claim the same generation/slot. Do not
+            # guess which one owns the logical manifest slot.
+            ambiguous.add(key)
+
+    serve = _read_managed_registry(log_dir / _VLLM_SERVE_REGISTRY)
+    for servers in serve.values():
+        if not isinstance(servers, dict):
+            continue
+        for entry in servers.values():
+            consider(entry, authority.vllm, "server_spec_digest")
+
+    if authority.tools is not None:
+        tools = _read_managed_registry(log_dir / _GPU_SERVER_REGISTRY)
+        for entry in tools.values():
+            consider(entry, authority.tools, "tool_spec_digest")
+
+    meta: Dict[str, Tuple[str, int]] = {}
+    ambiguous_jobs: Set[str] = set()
+    for key, (_generation, job_id, gpus) in selected.items():
+        if key in ambiguous or job_id in ambiguous_jobs:
+            continue
+        kind, _slot_id = key
+        existing = meta.get(job_id)
+        if existing is not None and existing != (kind, gpus):
+            # A scheduler allocation cannot be two differently attested hosts.
+            meta.pop(job_id, None)
+            ambiguous_jobs.add(job_id)
+            continue
+        meta[job_id] = (kind, gpus)
+    return meta
+
+
 def list_overlay_candidates(
     project_root: Path,
     snapshot: Optional[Dict[str, Dict[str, str]]] = None,
@@ -262,7 +641,19 @@ def list_overlay_candidates(
     """
     if snapshot is None:
         snapshot = get_user_jobs_snapshot()
-    meta = _build_jobid_meta_map(project_root)
+    if not getattr(snapshot, "authoritative", False):
+        return []
+    try:
+        authority = _managed_overlay_authority()
+        meta = (
+            _build_jobid_meta_map(project_root)
+            if authority is None
+            else _build_managed_jobid_meta_map(project_root, authority)
+        )
+    except ReservationStateError:
+        # A partial/malformed managed envelope or unreadable attestation must
+        # never fall back to broad legacy host discovery.
+        return []
     out: List[OverlayHost] = []
     for jid, info in snapshot.items():
         if jid not in meta:
@@ -287,27 +678,15 @@ def list_overlay_candidates(
 # ---------------------------------------------------------------------------
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError, ValueError, TypeError):
-        return False
-
-
-# Slots older than this are forcibly dropped — defense against a chain
-# process dying without finally-releasing its slot, with PID later recycled
-# to an unrelated process. Set well above the 4h sbatch time limit.
-_MAX_SLOT_AGE_SEC = 5 * 3600
-
-
 def _drop_stale_inplace(
     reservations: Dict[str, List[AgentSlot]],
     snapshot: Dict[str, Dict[str, str]],
 ) -> None:
-    """In-place: drop slots for jobs no longer RUNNING, with dead PIDs, or
-    whose age exceeds the per-job time limit."""
-    now = time.time()
+    """Drop only reservations proven dead by scheduler and PID identity."""
+    if not getattr(snapshot, "authoritative", False):
+        raise ReservationStateError(
+            "Authoritative scheduler state is required to reconcile overlays"
+        )
     for jid in list(reservations.keys()):
         info = snapshot.get(jid)
         if not info or info.get("status", "").upper() != "RUNNING":
@@ -315,7 +694,7 @@ def _drop_stale_inplace(
             continue
         kept = [
             s for s in reservations[jid]
-            if _pid_alive(s.pid) and (now - s.started_at) < _MAX_SLOT_AGE_SEC
+            if process_record_alive(s.pid, s.process_identity)
         ]
         if kept:
             reservations[jid] = kept
@@ -351,6 +730,8 @@ def try_reserve_slot(
 
     # Single snapshot read shared between candidate listing and stale cleanup.
     snapshot = get_user_jobs_snapshot()
+    if not getattr(snapshot, "authoritative", False):
+        return None
     candidates = list_overlay_candidates(project_root, snapshot=snapshot)
     if not candidates:
         return None
@@ -383,6 +764,7 @@ def try_reserve_slot(
             concurrency_gb=int(concurrency),
             pid=os.getpid(),
             started_at=time.time(),
+            process_identity=process_identity(os.getpid()),
         )
         reservations.setdefault(host.jobid, []).append(slot)
         _save_reservations(state_file, reservations)
@@ -415,7 +797,11 @@ def _build_srun_cmd(
     script_args: List[str],
     step_log_path: Path,
 ) -> List[str]:
-    return [
+    lifecycle_step_name = ""
+    lease_id = os.getenv("SPATIAL_AGENT_LEASE_ID", "").strip()
+    if lease_id:
+        lifecycle_step_name = format_evaluator_step_name(lease_id)
+    command = [
         "srun",
         f"--jobid={host.jobid}",
         "--overlap",
@@ -434,15 +820,19 @@ def _build_srun_cmd(
         "--gpus=0",
         f"--mem={int(concurrency_gb)}G",
         f"--cpus-per-task={OVERLAY_CPUS_PER_TASK}",
-        "bash", str(script_path), *script_args,
     ]
+    if lifecycle_step_name:
+        command.append(f"--job-name={lifecycle_step_name}")
+    command.extend(["bash", str(script_path), *script_args])
+    return command
 
 
 def _step_log_path(project_root: Path, jobid: str, slot_id: str) -> Path:
     """Per-overlay-step log file. Mirrors the slurm_agent/ convention."""
     log_dir = project_root.joinpath("spatial_agent", "logs", "slurm_agent")
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / f"overlay_{jobid}_{slot_id[:8]}.out"
+    slot_token = collision_safe_token(slot_id, max_length=64)
+    return log_dir / f"overlay_{jobid}_{slot_token}.out"
 
 
 def _run_overlay(

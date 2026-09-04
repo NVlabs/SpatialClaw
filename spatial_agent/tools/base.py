@@ -8,6 +8,7 @@ builder aggregates all descriptions at runtime.
 
 import json
 import logging
+import os
 import random
 import socket
 import time
@@ -45,6 +46,163 @@ def ensure_image_list(images) -> list:
 
 _REGISTRY_PATH = Path(__file__).parent.parent / "logs" / "gpu_server.json"
 
+_COMMON_LIFECYCLE_ENV_KEYS = (
+    "SPATIAL_AGENT_LEASE_ID",
+    "SPATIAL_AGENT_COHORT_ID",
+    "SPATIAL_AGENT_OWNER_ID",
+    "SPATIAL_AGENT_WORKLOAD_POLICY_DIGEST",
+    "SPATIAL_AGENT_SERVICE_MANIFEST_DIGEST",
+)
+_TOOL_LIFECYCLE_ENV_KEYS = _COMMON_LIFECYCLE_ENV_KEYS + (
+    "SPATIAL_AGENT_TOOL_POOL_ID",
+    "SPATIAL_AGENT_TOOL_NAMESPACE",
+    "SPATIAL_AGENT_TOOL_SPEC_DIGEST",
+    "SPATIAL_AGENT_TOOL_TOPOLOGY_DIGEST",
+    "SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST",
+)
+_VLLM_LIFECYCLE_ENV_KEYS = (
+    "SPATIAL_AGENT_VLLM_POOL_ID",
+    "SPATIAL_AGENT_VLLM_NAMESPACE",
+    "SPATIAL_AGENT_VLLM_SERVER_SPEC_DIGEST",
+    "SPATIAL_AGENT_VLLM_TOPOLOGY_DIGEST",
+    "SPATIAL_AGENT_VLLM_SLOT_ALLOWLIST",
+)
+_GLOBAL_LIFECYCLE_ENV_KEYS = (
+    _TOOL_LIFECYCLE_ENV_KEYS + _VLLM_LIFECYCLE_ENV_KEYS
+)
+
+
+def _tool_lifecycle_requested() -> bool:
+    """Treat any core key, including cross-service residue, as managed."""
+    return any(name in os.environ for name in _GLOBAL_LIFECYCLE_ENV_KEYS)
+
+
+def _managed_tool_envelope() -> Optional[dict[str, Any]]:
+    """Validate and return the exact managed-client GPU-tool envelope."""
+    values = {
+        name: os.getenv(name, "").strip()
+        for name in _TOOL_LIFECYCLE_ENV_KEYS
+        if name != "SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST"
+    }
+    missing = sorted(name for name, value in values.items() if not value)
+    raw_slots = os.getenv("SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST", "")
+    try:
+        decoded_slots = json.loads(raw_slots)
+    except (json.JSONDecodeError, TypeError):
+        decoded_slots = None
+    if (
+        not isinstance(decoded_slots, list)
+        or not decoded_slots
+        or any(not isinstance(slot, str) or not slot.strip() for slot in decoded_slots)
+    ):
+        missing.append("SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST")
+        slots: set[str] = set()
+    else:
+        slots = {slot.strip() for slot in decoded_slots}
+        if len(slots) != len(decoded_slots):
+            missing.append("SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST")
+
+    if missing:
+        logger.error(
+            "Managed GPU-tool discovery has an incomplete or malformed exact "
+            "client envelope (%s); failing closed",
+            ", ".join(sorted(set(missing))),
+        )
+        return None
+    return {**values, "slots": slots}
+
+
+def _json_env_set(name: str) -> Optional[set[str]]:
+    raw = os.getenv(name)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Malformed %s; failing managed discovery closed", name)
+        return set()
+    if not isinstance(value, list):
+        logger.warning("Non-list %s; failing managed discovery closed", name)
+        return set()
+    return {str(item) for item in value}
+
+
+def _managed_tool_record_is_attested(
+    info: dict,
+    *,
+    expected_tool_spec_digest: str,
+    expected_topology_digest: str,
+) -> bool:
+    """Validate one managed tool record against its frozen manifest identity."""
+    if (
+        not expected_tool_spec_digest
+        or not expected_topology_digest
+        or info.get("tool_spec_digest") != expected_tool_spec_digest
+        or info.get("topology_digest") != expected_topology_digest
+        or info.get("service") != "spatial-gpu-tools"
+    ):
+        return False
+
+    backend = info.get("reconstruct_backend")
+    if not backend or info.get("backend") != backend:
+        return False
+    if info.get("protocol_version") != PROTOCOL_VERSION:
+        return False
+
+    tools = info.get("tools")
+    health = info.get("health")
+    if not isinstance(tools, list) or not tools or not isinstance(health, dict):
+        return False
+    protocol = health.get("protocol")
+    if not isinstance(protocol, dict) or (
+        health.get("status") != "ok"
+        or health.get("service") != "spatial-gpu-tools"
+        or health.get("backend") != backend
+        or protocol.get("name") != "spatial-gpu-rpc"
+        or protocol.get("version") != PROTOCOL_VERSION
+        or list(health.get("expected_tools") or []) != tools
+        or list(health.get("deployed_tools") or []) != tools
+    ):
+        return False
+
+    deployments = {f"spatial_{name}" for name in tools}
+    if set(health.get("tools") or []) != deployments:
+        return False
+    effective_models = health.get("effective_models")
+    if (
+        not isinstance(effective_models, dict)
+        or set(effective_models) != deployments
+        or any(not isinstance(value, dict) for value in effective_models.values())
+    ):
+        return False
+
+    gpu = health.get("gpu")
+    try:
+        if (
+            not isinstance(gpu, dict)
+            or int(gpu.get("requested_count")) != int(info.get("num_gpus"))
+        ):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    keepalive = health.get("synthetic_keepalive")
+    if (
+        "synthetic_keepalive_requested" not in info
+        or "synthetic_keepalive_effective" not in info
+        or not isinstance(keepalive, dict)
+        or "requested" not in keepalive
+        or "effective" not in keepalive
+        or (
+            bool(keepalive.get("requested"))
+            != bool(info.get("synthetic_keepalive_requested"))
+            or bool(keepalive.get("effective"))
+            != bool(info.get("synthetic_keepalive_effective"))
+        )
+    ):
+        return False
+    return True
+
 
 def _read_registry() -> dict:
     """Read gpu_server.json and return the full dict."""
@@ -52,9 +210,20 @@ def _read_registry() -> dict:
         return {}
     try:
         with open(_REGISTRY_PATH, "r") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
+            registry = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        if _tool_lifecycle_requested():
+            raise RuntimeError(
+                f"Managed GPU registry is unreadable or corrupt: {_REGISTRY_PATH}"
+            ) from exc
         return {}
+    if not isinstance(registry, dict):
+        if _tool_lifecycle_requested():
+            raise RuntimeError(
+                f"Managed GPU registry root is not an object: {_REGISTRY_PATH}"
+            )
+        return {}
+    return registry
 
 
 def _is_port_open(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -64,6 +233,62 @@ def _is_port_open(host: str, port: int, timeout: float = 5.0) -> bool:
             return True
     except (OSError, socket.timeout):
         return False
+
+
+def _managed_tool_health_is_attested(
+    info: dict, *, ip: str, port: int, auth_token: str,
+) -> bool:
+    """Revalidate one managed server's live authenticated identity."""
+    url_host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+    try:
+        response = requests.get(
+            f"http://{url_host}:{port}/health",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            timeout=5.0,
+        )
+        if response.status_code != 200:
+            return False
+        health = response.json()
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return False
+    if not isinstance(health, dict):
+        return False
+
+    recorded_health = info.get("health")
+    if not isinstance(recorded_health, dict):
+        return False
+    protocol = health.get("protocol")
+    tools = info.get("tools")
+    deployments = sorted(f"spatial_{name}" for name in tools or [])
+    if (
+        health.get("status") != "ok"
+        or health.get("service") != "spatial-gpu-tools"
+        or health.get("backend") != info.get("reconstruct_backend")
+        or health.get("state") != "ready"
+        or health.get("accepting") is not True
+        or health.get("draining") is not False
+        or protocol != {
+            "name": "spatial-gpu-rpc", "version": PROTOCOL_VERSION,
+        }
+        or health.get("expected_tools") != tools
+        or health.get("deployed_tools") != tools
+        or sorted(health.get("tools") or []) != deployments
+    ):
+        return False
+
+    for key in (
+        "pool_id", "namespace", "slot_id", "tool_spec_digest",
+        "topology_digest",
+    ):
+        if health.get(key) != info.get(key):
+            return False
+    if str(health.get("generation")) != str(info.get("generation")):
+        return False
+
+    for key in ("effective_models", "gpu", "synthetic_keepalive"):
+        if health.get(key) != recorded_health.get(key):
+            return False
+    return True
 
 
 def _deployment_to_tool(deployment_name: str) -> Optional[str]:
@@ -85,27 +310,173 @@ def _find_alive_server_connection(
     list (e.g. ``"Reconstruct"`` or ``"SAM3"``). When None, any alive server
     is acceptable.
     """
-    entries = list(registry.values())
-    random.shuffle(entries)
-    for info in entries:
-        if tool_name is not None and tool_name not in info.get("tools", []):
+    managed = _tool_lifecycle_requested()
+    managed_envelope = _managed_tool_envelope() if managed else None
+    if managed and managed_envelope is None:
+        return None
+    if not managed:
+        # Preserve the historical flat, per-call randomized legacy routing.
+        # Managed generations are excluded because an unleased client cannot
+        # safely keep them alive during automatic drain.
+        entries = [
+            info for info in registry.values()
+            if isinstance(info, dict) and not info.get("pool_id")
+        ]
+        random.shuffle(entries)
+        for info in entries:
+            if tool_name is not None and tool_name not in info.get("tools", []):
+                continue
+            ip = info.get("ip")
+            port = info.get("http_port")
+            auth_token = info.get("auth_token")
+            if (
+                not ip
+                or not port
+                or info.get("protocol_version") != PROTOCOL_VERSION
+                or not isinstance(auth_token, str)
+                or not auth_token
+            ):
+                continue
+            if _is_port_open(ip, port):
+                url_host = (
+                    f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+                )
+                return f"http://{url_host}:{port}", auth_token
+            logger.debug(
+                "[GPUTool] Server %s:%s unreachable, skipping.", ip, port,
+            )
+        return None
+    uid_allowlist = _json_env_set("SPATIAL_AGENT_GPU_SERVER_UID_ALLOWLIST")
+    slot_allowlist = (
+        managed_envelope["slots"]
+        if managed_envelope is not None
+        else _json_env_set("SPATIAL_AGENT_GPU_SERVER_SLOT_ALLOWLIST")
+    )
+    required_pool = (
+        managed_envelope["SPATIAL_AGENT_TOOL_POOL_ID"]
+        if managed_envelope is not None else ""
+    )
+    required_namespace = (
+        managed_envelope["SPATIAL_AGENT_TOOL_NAMESPACE"]
+        if managed_envelope is not None else ""
+    )
+    expected_tool_spec_digest = (
+        managed_envelope["SPATIAL_AGENT_TOOL_SPEC_DIGEST"]
+        if managed_envelope is not None else ""
+    )
+    expected_topology_digest = (
+        managed_envelope["SPATIAL_AGENT_TOOL_TOPOLOGY_DIGEST"]
+        if managed_envelope is not None else ""
+    )
+    candidates_by_slot: dict[str, list[tuple[int, str, dict]]] = {}
+    for uid, info in registry.items():
+        if not isinstance(info, dict):
             continue
+        # Managed pools are lease-scoped.  A direct/unmanaged client has no
+        # ownership record, so allowing it to use one would make automatic
+        # drain unsafe.  Such clients must use a manual legacy pool or be
+        # launched with the manager-provided pool/namespace manifest.
+        if info.get("pool_id") and not required_pool:
+            continue
+        if uid_allowlist is not None and uid not in uid_allowlist:
+            continue
+        if required_pool and info.get("pool_id") != required_pool:
+            continue
+        if required_namespace and info.get("namespace") != required_namespace:
+            continue
+        if required_pool:
+            try:
+                attested = _managed_tool_record_is_attested(
+                    info,
+                    expected_tool_spec_digest=expected_tool_spec_digest,
+                    expected_topology_digest=expected_topology_digest,
+                )
+            except (TypeError, ValueError):
+                # One malformed registry record must not hide an otherwise
+                # valid generation for the same frozen slot.
+                attested = False
+            if not attested:
+                continue
+        # A successor is not eligible to replace its predecessor until it is
+        # fully accepting.  Grouping first would let a higher STARTING
+        # generation hide the still-healthy prior generation for this slot.
+        if info.get("state", "ready") not in {"ready", "accepting"}:
+            continue
+        if info.get("draining") or info.get("accepting") is False:
+            continue
+        slot_id = str(info.get("slot_id") or uid)
+        if slot_allowlist is not None and slot_id not in slot_allowlist:
+            continue
+        try:
+            generation = int(info.get("generation") or 0)
+        except (TypeError, ValueError):
+            continue
+        candidates_by_slot.setdefault(slot_id, []).append(
+            (generation, str(uid), info)
+        )
+
+    # Resolve health *within* each logical slot.  Selecting the newest record
+    # before validating its connection would let a dead or malformed
+    # successor shadow a healthy predecessor.  UID allowlists, when present,
+    # have already been applied above, so an exact-generation pin still fails
+    # closed instead of falling back outside its authority.
+    reachable_slots: set[str] = set()
+    entries: list[tuple[str, dict]] = []
+    for slot_id, candidates in candidates_by_slot.items():
+        selected: Optional[tuple[str, dict]] = None
+        for _generation, uid, info in sorted(
+            candidates, key=lambda item: (item[0], item[1]), reverse=True
+        ):
+            tools = info.get("tools")
+            ip = info.get("ip")
+            port = info.get("http_port")
+            auth_token = info.get("auth_token")
+            try:
+                port_number = int(port)
+            except (TypeError, ValueError):
+                continue
+            if (
+                not isinstance(tools, list)
+                or not tools
+                or not isinstance(ip, str)
+                or not ip
+                or not 1 <= port_number <= 65535
+                or info.get("protocol_version") != PROTOCOL_VERSION
+                or not isinstance(auth_token, str)
+                or not auth_token
+            ):
+                continue
+            healthy = _managed_tool_health_is_attested(
+                info,
+                ip=ip,
+                port=port_number,
+                auth_token=auth_token,
+            )
+            if not healthy:
+                logger.debug(
+                    "[GPUTool] Server %s:%s unhealthy, trying prior "
+                    "generation for slot %s.",
+                    ip,
+                    port_number,
+                    slot_id,
+                )
+                continue
+            reachable_slots.add(slot_id)
+            if tool_name is None or tool_name in tools:
+                selected = (uid, {**info, "http_port": port_number})
+                break
+        if selected is not None:
+            entries.append(selected)
+
+    if slot_allowlist is not None and reachable_slots != slot_allowlist:
+        return None
+    random.shuffle(entries)
+    for uid, info in entries:
         ip = info.get("ip")
         port = info.get("http_port")
         auth_token = info.get("auth_token")
-        if (
-            not ip
-            or not port
-            or info.get("protocol_version") != PROTOCOL_VERSION
-            or not isinstance(auth_token, str)
-            or not auth_token
-        ):
-            continue
-        if _is_port_open(ip, port):
-            url_host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
-            return f"http://{url_host}:{port}", auth_token
-        else:
-            logger.debug("[GPUTool] Server %s:%s unreachable, skipping.", ip, port)
+        url_host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
+        return f"http://{url_host}:{port}", auth_token
     return None
 
 
@@ -267,13 +638,29 @@ class GPUTool:
         for attempt in range(self._max_retries):
             try:
                 url, auth_token = _get_server_connection(tool_name)
+                headers = {
+                    "Authorization": f"Bearer {auth_token}",
+                    "Content-Type": "application/json",
+                }
+                # Attribution is carried only in HTTP headers; it never enters
+                # the tool payload seen by the model or tool implementation.
+                for header, env_name in (
+                    ("X-Spatial-Agent-Owner", "SPATIAL_AGENT_OWNER_ID"),
+                    ("X-Spatial-Agent-Cohort", "SPATIAL_AGENT_COHORT_ID"),
+                    ("X-Spatial-Agent-Lease", "SPATIAL_AGENT_LEASE_ID"),
+                    (
+                        "X-Spatial-Agent-Manifest",
+                        "SPATIAL_AGENT_SERVICE_MANIFEST_DIGEST",
+                    ),
+                ):
+                    value = os.getenv(env_name)
+                    if value:
+                        headers[header] = value
+
                 resp = requests.post(
                     f"{url}/call",
                     data=payload,
-                    headers={
-                        "Authorization": f"Bearer {auth_token}",
-                        "Content-Type": "application/json",
-                    },
+                    headers=headers,
                     timeout=_HTTP_TIMEOUT,
                 )
 

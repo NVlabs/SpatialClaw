@@ -108,6 +108,7 @@ class LLMRoleParams:
     presence_penalty: Optional[float] = None
     repetition_penalty: Optional[float] = None
     enable_thinking: Optional[bool] = None
+    seed: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -132,6 +133,26 @@ class SpatialAgentConfig:
     llm_model: str = ""
     llm_base_url: str = ""  # 'vllm' triggers serve.json auto-discovery
     llm_api_key: str = ""
+    # Optional model-profile identity used for output isolation.  It does not
+    # change the served model name and therefore remains dataset-agnostic.
+    model_profile: Optional[str] = None
+    # Model configs may opt in to locking their declared model identity so a
+    # later CLI override cannot move model-specific behavior to a backbone for
+    # which it was not designed.
+    lock_llm_model: bool = False
+
+    # --- Opt-in LLM retry controls ---
+    # ``None`` preserves the historical OpenAI SDK and outer-loop behavior.
+    # Model profiles may disable hidden SDK retries and explicit outer
+    # generation-deadline retries without changing transport/server retries.
+    llm_sdk_max_retries: Optional[int] = None
+    llm_timeout_retries: Optional[int] = None
+    finalize_on_llm_timeout: bool = False
+    # Explicit outer request budgets. ``None`` preserves the historical
+    # environment-variable/default resolution. Model profiles pin these so
+    # an inherited shell environment cannot silently change benchmark results.
+    llm_request_timeout_sec: Optional[float] = None
+    vlm_request_timeout_sec: Optional[float] = None
 
     # --- LLM Role Parameters ---
     main_params: LLMRoleParams = field(default_factory=LLMRoleParams)
@@ -149,6 +170,9 @@ class SpatialAgentConfig:
     general_params: LLMRoleParams = field(
         default_factory=lambda: LLMRoleParams(max_tokens=32768, enable_thinking=False)
     )
+    direct_answer_params: LLMRoleParams = field(
+        default_factory=lambda: LLMRoleParams(max_tokens=32768, enable_thinking=False)
+    )
 
     # --- Agent Loop ---
     max_steps: int = 30
@@ -158,9 +182,58 @@ class SpatialAgentConfig:
 
     # --- Opt-in Protocol Fixes ---
     # Disabled by default so existing backbone configs retain legacy behavior.
-    # Model configs may enable either fix independently.
+    # Model configs may enable these fixes independently.
     explicit_planner_frame_mapping: bool = False
     safe_multimodal_fallback: bool = False
+    # Encode an entire image batch on a worker thread before constructing a
+    # vision request.  The encoded bytes and ordering are unchanged; only the
+    # CPU-bound work is moved off the asyncio event loop. This is model opt-in
+    # because historical backbone profiles must retain their execution path.
+    offload_multimodal_encoding: bool = False
+
+    # Normalize schema-valid bare-name answer submissions such as
+    # ``ReturnAnswer(A)`` to ``ReturnAnswer("A")``. The implementation is AST
+    # guarded and leaves strings, comments, attribute calls, and known kernel
+    # variables untouched. Only affects the agent loop; the CoT baseline never
+    # executes code.
+    normalize_answer_symbols: bool = False
+    # Record exact, result-neutral RGB fingerprints of the visual inputs used
+    # by an evaluation.  Disabled by default; model profiles opt in when
+    # overlap-matched comparisons require auditable input parity.
+    record_input_fingerprints: bool = False
+    # Visual preparation used by the CoT comparator.  Keeping the historical
+    # default here makes overlap-matched preparation a model-profile choice.
+    cot_frame_preparation: str = "legacy"
+
+    # Controller-managed, model-specific behavior. All fields are inert by
+    # default so existing backbones keep the historical graph behavior.
+    direct_answer_anchor: bool = False
+    evidence_gated_override: bool = False
+    restrict_adjudicator_to_candidates: bool = False
+    require_novel_visual_override_evidence: bool = False
+    # When the loop's proposal disagrees with the anchor and no override
+    # evidence was collected, run the restricted adjudication instead of
+    # silently returning the anchor. On inline-image datasets every input is a
+    # key frame, so evidence_count is structurally zero and the anchor would
+    # otherwise win every disagreement unexamined.
+    adjudicate_when_no_evidence: bool = False
+    # Count the first inspection of each inline input image as loop progress
+    # (new_evidence_last_step) without crediting it as override evidence.
+    # Prevents soft_step_limit from starving image-only samples whose only
+    # possible visual action is re-inspecting inline inputs. Inert on video
+    # inputs, where novel frames are acquirable and count normally.
+    credit_inline_reinspection: bool = False
+    # Accept a bare schema-valid answer token (e.g. a response that is only
+    # "C") as an answer submission instead of a format-validation failure.
+    accept_bare_letter_answers: bool = False
+    # Recover embedded multiple-choice labels without mistaking label-like
+    # option text for additional choices.  This parser correction is an
+    # independent model opt-in so every other backbone retains its historical
+    # answer-schema behavior.
+    robust_embedded_choice_schema: bool = False
+    reserve_final_answer_turn: bool = False
+    no_progress_limit: int = 0  # repeated action+outcome transitions; 0 disables
+    soft_step_limit: int = 0  # stop after this many steps without fresh evidence
 
     # --- Executor Variant ---
     # "code"        : free-form Python per step (default, the SpatialClaw interface).
@@ -306,16 +379,135 @@ class SpatialAgentConfig:
             if key in data and data[key] is not None:
                 setattr(self, key, _expand_env_vars(data[key]))
 
+        profile = data.get("model_profile")
+        if profile is not None and (
+            not isinstance(profile, str)
+            or not profile
+            or re.fullmatch(r"[A-Za-z0-9._-]+", profile) is None
+        ):
+            raise ValueError(
+                "Model config field 'model_profile' must be a non-empty "
+                "filesystem-safe string"
+            )
+        self.model_profile = profile
+
+        lock_llm_model = data.get("lock_llm_model", False)
+        if not isinstance(lock_llm_model, bool):
+            raise ValueError("Model config field 'lock_llm_model' must be a boolean")
+        declared_model = data.get("llm_model")
+        expanded_declared_model = _expand_env_vars(declared_model)
+        if lock_llm_model and (
+            not isinstance(declared_model, str)
+            or not isinstance(expanded_declared_model, str)
+            or not expanded_declared_model
+        ):
+            raise ValueError(
+                "Model config field 'lock_llm_model' requires this model JSON "
+                "to declare a non-empty string 'llm_model'"
+            )
+        self.lock_llm_model = lock_llm_model
+        self._locked_llm_model = (
+            expanded_declared_model if lock_llm_model else None
+        )
+
         # Optional model-specific protocol fixes. Keeping these default-off
         # preserves legacy behavior for every backbone that does not opt in.
         for key in (
             "explicit_planner_frame_mapping",
             "safe_multimodal_fallback",
+            "offload_multimodal_encoding",
+            "normalize_answer_symbols",
+            "record_input_fingerprints",
+            "enable_planning",
+            "direct_answer_anchor",
+            "evidence_gated_override",
+            "restrict_adjudicator_to_candidates",
+            "require_novel_visual_override_evidence",
+            "adjudicate_when_no_evidence",
+            "credit_inline_reinspection",
+            "accept_bare_letter_answers",
+            "robust_embedded_choice_schema",
+            "reserve_final_answer_turn",
+            "finalize_on_llm_timeout",
         ):
             if key in data and data[key] is not None:
                 if not isinstance(data[key], bool):
                     raise ValueError(f"Model config field {key!r} must be a boolean")
                 setattr(self, key, data[key])
+
+        # Model-scoped retry and request-deadline controls.
+        for key in ("llm_sdk_max_retries", "llm_timeout_retries"):
+            if key not in data or data[key] is None:
+                continue
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"Model config field {key!r} must be an integer >= 0"
+                )
+            setattr(self, key, value)
+
+        for key in ("llm_request_timeout_sec", "vlm_request_timeout_sec"):
+            if key not in data or data[key] is None:
+                continue
+            value = data[key]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError(f"Model config field {key!r} must be a number > 0")
+            setattr(self, key, float(value))
+
+        # Opt-in integer loop-policy overrides. Same rationale: absent keys
+        # leave every other backbone's behavior untouched.
+        for key in (
+            "max_steps",
+            "max_failures",
+            "no_progress_limit",
+            "soft_step_limit",
+        ):
+            if key in data and data[key] is not None:
+                if isinstance(data[key], bool) or not isinstance(data[key], int):
+                    raise ValueError(f"Model config field {key!r} must be an integer")
+                setattr(self, key, data[key])
+
+        for key in (
+            "max_steps",
+            "max_failures",
+            "no_progress_limit",
+            "soft_step_limit",
+        ):
+            value = getattr(self, key)
+            minimum = 1 if key in ("max_steps", "max_failures") else 0
+            if value < minimum:
+                raise ValueError(
+                    f"Model config field {key!r} must be >= {minimum}, got {value}"
+                )
+        if self.soft_step_limit and self.soft_step_limit >= self.max_steps:
+            raise ValueError(
+                "Model config field 'soft_step_limit' must be less than 'max_steps'"
+            )
+
+        if "executor_type" in data and data["executor_type"] is not None:
+            executor_type = data["executor_type"]
+            if executor_type not in {"code", "react", "single_pass"}:
+                raise ValueError(
+                    "Model config field 'executor_type' must be one of "
+                    "'code', 'react', or 'single_pass'"
+                )
+            self.executor_type = executor_type
+
+        if (
+            "cot_frame_preparation" in data
+            and data["cot_frame_preparation"] is not None
+        ):
+            cot_frame_preparation = data["cot_frame_preparation"]
+            if cot_frame_preparation not in {"legacy", "spatial-agent"}:
+                raise ValueError(
+                    "Model config field 'cot_frame_preparation' must be "
+                    "'legacy' or 'spatial-agent'"
+                )
+            self.cot_frame_preparation = cot_frame_preparation
 
         # Role params
         roles = data.get("roles", {})
@@ -325,6 +517,7 @@ class SpatialAgentConfig:
             "vlm_grounding": "vlm_grounding_params",
             "planning": "planning_params",
             "general": "general_params",
+            "direct_answer": "direct_answer_params",
             "reflection": "reflection_params",
         }
         for role_name, attr_name in role_map.items():
@@ -335,6 +528,19 @@ class SpatialAgentConfig:
         """Load dataset/benchmark overrides from a dataset config file."""
         with open(config_path, "r") as f:
             data = json.load(f)
+        model_only_fields = {
+            "adjudicate_when_no_evidence",
+            "credit_inline_reinspection",
+            "accept_bare_letter_answers",
+            "robust_embedded_choice_schema",
+            "cot_frame_preparation",
+        }
+        misplaced = sorted(model_only_fields.intersection(data))
+        if misplaced:
+            raise ValueError(
+                "Dataset config may not set model-only field(s): "
+                + ", ".join(misplaced)
+            )
         for key, value in data.items():
             if value is not None and hasattr(self, key):
                 setattr(self, key, value)
@@ -344,6 +550,79 @@ class SpatialAgentConfig:
         for key, value in vars(args).items():
             if value is not None and hasattr(self, key):
                 setattr(self, key, value)
+
+    def validate(self) -> None:
+        """Validate the fully layered dataset/model/CLI configuration."""
+        if not isinstance(self.lock_llm_model, bool):
+            raise ValueError("Config field 'lock_llm_model' must be a boolean")
+        if self.model_profile is not None and (
+            not isinstance(self.model_profile, str)
+            or not self.model_profile
+            or re.fullmatch(r"[A-Za-z0-9._-]+", self.model_profile) is None
+        ):
+            raise ValueError(
+                "Config field 'model_profile' must be a non-empty "
+                "filesystem-safe string"
+            )
+        locked_model = getattr(self, "_locked_llm_model", None)
+        if locked_model is not None and self.llm_model != locked_model:
+            raise ValueError(
+                "Model config locks llm_model="
+                f"{locked_model!r}; got conflicting override {self.llm_model!r}"
+            )
+        for key in (
+            "enable_planning",
+            "direct_answer_anchor",
+            "evidence_gated_override",
+            "restrict_adjudicator_to_candidates",
+            "require_novel_visual_override_evidence",
+            "adjudicate_when_no_evidence",
+            "credit_inline_reinspection",
+            "accept_bare_letter_answers",
+            "robust_embedded_choice_schema",
+            "reserve_final_answer_turn",
+            "normalize_answer_symbols",
+            "record_input_fingerprints",
+            "offload_multimodal_encoding",
+            "finalize_on_llm_timeout",
+        ):
+            if not isinstance(getattr(self, key), bool):
+                raise ValueError(f"Config field {key!r} must be a boolean")
+        for key in (
+            "max_steps",
+            "max_failures",
+            "no_progress_limit",
+            "soft_step_limit",
+        ):
+            value = getattr(self, key)
+            minimum = 1 if key in ("max_steps", "max_failures") else 0
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(f"Config field {key!r} must be an integer >= {minimum}")
+        if self.soft_step_limit and self.soft_step_limit >= self.max_steps:
+            raise ValueError("Config field 'soft_step_limit' must be less than 'max_steps'")
+        for key in ("llm_sdk_max_retries", "llm_timeout_retries"):
+            value = getattr(self, key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"Config field {key!r} must be None or an integer >= 0")
+        for key in ("llm_request_timeout_sec", "vlm_request_timeout_sec"):
+            value = getattr(self, key)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value <= 0
+            ):
+                raise ValueError(f"Config field {key!r} must be None or a number > 0")
+        if self.executor_type not in {"code", "react", "single_pass"}:
+            raise ValueError(
+                "Config field 'executor_type' must be one of 'code', 'react', or 'single_pass'"
+            )
+        if self.cot_frame_preparation not in {"legacy", "spatial-agent"}:
+            raise ValueError(
+                "Config field 'cot_frame_preparation' must be 'legacy' or "
+                "'spatial-agent'"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize config to dict for logging."""

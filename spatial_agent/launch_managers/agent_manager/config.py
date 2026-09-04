@@ -33,6 +33,23 @@ class ManagerConfig:
     cot_default_concurrency: int = 32
     cot_default_max_frames: int = 32
     cot_default_system_prompt: str = "cot"
+    # Lifecycle ownership remains opt-in until matched benchmark validation
+    # demonstrates result equivalence under the managed execution envelope.
+    service_lifecycle_enabled: bool = False
+    # Scheduler-PENDING time does not consume GPUs for the pending service job
+    # and therefore has a separate, relatively generous deadline.
+    service_readiness_timeout_minutes: int = 240
+    # Once any requested service allocation is RUNNING/CONFIGURING (or has
+    # published a registry record), bound the partially-ready GPU interval.
+    service_running_readiness_timeout_minutes: int = 15
+    # Managed evaluators do not retain an otherwise-idle GPU service lease
+    # indefinitely while their CPU allocation remains scheduler-PENDING.
+    evaluator_pending_wait_minutes: int = 15
+    # A successor allocation needs a recent, epoch-fenced owner heartbeat.
+    service_renewal_heartbeat_ttl_minutes: int = 5
+    # Allow Slurm COMPLETING/controller transients to clear, but never wait
+    # indefinitely while finalizing a lease.
+    service_finalize_timeout_minutes: int = 5
 
 
 def load_config(project_root: Path = None) -> ManagerConfig:
@@ -72,4 +89,20 @@ def load_config(project_root: Path = None) -> ManagerConfig:
         cot_default_concurrency=raw.get("cot_default_concurrency", 32),
         cot_default_max_frames=raw.get("cot_default_max_frames", 32),
         cot_default_system_prompt=raw.get("cot_default_system_prompt", "cot"),
+        service_lifecycle_enabled=raw.get("service_lifecycle_enabled", False),
+        service_readiness_timeout_minutes=raw.get(
+            "service_readiness_timeout_minutes", 240
+        ),
+        service_running_readiness_timeout_minutes=raw.get(
+            "service_running_readiness_timeout_minutes", 15
+        ),
+        evaluator_pending_wait_minutes=raw.get(
+            "evaluator_pending_wait_minutes", 15
+        ),
+        service_renewal_heartbeat_ttl_minutes=raw.get(
+            "service_renewal_heartbeat_ttl_minutes", 5
+        ),
+        service_finalize_timeout_minutes=raw.get(
+            "service_finalize_timeout_minutes", 5
+        ),
     )

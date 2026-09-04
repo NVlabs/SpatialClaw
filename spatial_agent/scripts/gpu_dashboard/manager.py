@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +33,28 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from spatial_agent.gpu_dashboard.sampler import SamplerThread
+
+
+def _write_unique_sbatch(
+    output_dir: Path, job_name: str, script_content: str,
+) -> Path:
+    """Create one private batch artifact without a truncating name race."""
+    fd, raw_path = tempfile.mkstemp(
+        prefix=f"{job_name}_", suffix=".sbatch", dir=output_dir,
+    )
+    script_path = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(script_content)
+        script_path.chmod(0o755)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        script_path.unlink(missing_ok=True)
+        raise
+    return script_path
 
 
 class SlurmGpuDashboardManager:
@@ -261,10 +284,10 @@ echo "End: $(date)"
 
     def submit_job(self) -> bool:
         print(colored(f"[{self._ts()}] Submitting job #{self.job_counter}...", "cyan"), flush=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        script_path = self.output_dir / f"{self.job_name}_{stamp}.sbatch"
-        script_path.write_text(self._generate_slurm_script(self.job_counter))
-        script_path.chmod(0o755)
+        script_path = _write_unique_sbatch(
+            self.output_dir, self.job_name,
+            self._generate_slurm_script(self.job_counter),
+        )
 
         res = subprocess.run(["sbatch", str(script_path)], capture_output=True, text=True)
         if res.returncode != 0:

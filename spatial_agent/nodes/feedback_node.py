@@ -1,6 +1,10 @@
 """feedback_node: builds feedback text, detects ReturnAnswer, manages kernel state."""
 
-from typing import Any, Dict, List
+import ast
+import hashlib
+import json
+import re
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langchain_core.runnables import RunnableConfig
@@ -13,6 +17,242 @@ from spatial_agent.kernel.feedback_collector import (
     _truncate_code_at_error,
 )
 from spatial_agent.state import AgentState
+
+
+def visual_fingerprint(image: Any) -> Optional[str]:
+    """Return an exact RGB-pixel fingerprint, or ``None`` if unavailable."""
+    try:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        digest = hashlib.sha256()
+        digest.update(f"{width}x{height}:RGB:".encode("ascii"))
+        digest.update(rgb.tobytes())
+        return digest.hexdigest()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _canonical_action(code: str) -> str:
+    """Canonicalize syntax while preserving literal values exactly."""
+    try:
+        return ast.dump(ast.parse(code), include_attributes=False)
+    except (SyntaxError, ValueError):
+        return code.strip()
+
+
+def _stable_text(value: Any) -> str:
+    """Remove volatile identifiers that do not represent new information."""
+    text = str(value or "")[:8000].strip()
+    text = re.sub(r"\b(?:vlm_q|query)[-_][A-Za-z0-9_-]+\b", "<query-id>", text)
+    text = re.sub(r"/tmp/[^\s'\"]+", "<tmp-path>", text)
+    text = re.sub(r"\bCell In\[\d+\]", "Cell In[<n>]", text)
+    text = re.sub(r"\b0x[0-9a-fA-F]+\b", "<address>", text)
+    return text
+
+
+def _outcome_signature(
+    step_result: Dict[str, Any],
+    var_summaries: Dict[str, Any],
+) -> str:
+    payload = {
+        "error": _stable_text(step_result.get("error")),
+        "stdout": _stable_text(step_result.get("stdout")),
+        "variables": {
+            str(name): _stable_text(value)
+            for name, value in sorted(var_summaries.items())
+        },
+        # Query IDs and image paths are intentionally excluded.
+        "vlm": [
+            {
+                "type": query.get("query_type", ""),
+                "question": _stable_text(query.get("question")),
+                "answer": _stable_text(query.get("answer")),
+            }
+            for query in step_result.get("vlm_queries", [])
+        ],
+        "shown": [
+            {
+                "label": _stable_text(entry.get("label")),
+                "count": len(entry.get("images", [])),
+            }
+            for entry in step_result.get("show_images", [])
+        ],
+        "tool_calls": int(step_result.get("tool_call_count", 0) or 0),
+    }
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _evidence_summary(
+    step_result: Dict[str, Any],
+    var_summaries: Dict[str, Any],
+    *,
+    shown_images: Optional[List[Any]] = None,
+) -> str | None:
+    """Summarize controller-observed evidence; reasoning alone never counts."""
+    if step_result.get("error"):
+        return None
+
+    parts: List[str] = []
+    answers = []
+    for query in step_result.get("vlm_queries", []):
+        answer = _stable_text(query.get("answer"))
+        if query.get("query_type") == "log":
+            continue
+        if not answer or answer.lower().startswith("[vlm error]"):
+            continue
+        answers.append(answer)
+    if answers:
+        parts.append("VLM observation: " + " | ".join(answers[:2])[:700])
+
+    if shown_images is None:
+        shown_images = [
+            image
+            for entry in step_result.get("show_images", [])
+            for image in entry.get("images", [])
+        ]
+    shown = len(shown_images)
+    if shown:
+        labels = [
+            _stable_text(entry.get("label"))
+            for entry in step_result.get("show_images", [])
+            if _stable_text(entry.get("label"))
+        ]
+        suffix = f" ({', '.join(labels[:3])})" if labels else ""
+        parts.append(f"Inspected {shown} new visualization(s){suffix}")
+
+    # A tool call only counts if it produced observable output or new state.
+    if int(step_result.get("tool_call_count", 0) or 0) > 0:
+        stdout = _stable_text(step_result.get("stdout"))
+        if stdout or var_summaries:
+            detail = stdout[:400] if stdout else ", ".join(sorted(var_summaries))
+            parts.append("Tool result: " + detail)
+
+    return "; ".join(parts)[:1200] if parts else None
+
+
+def _progress_updates(
+    state: AgentState,
+    step_result: Dict[str, Any],
+    var_summaries: Dict[str, Any],
+    *,
+    require_novel_visual_evidence: bool = False,
+    initial_visual_fingerprints: Optional[List[str]] = None,
+    credit_inline_reinspection: bool = False,
+) -> Dict[str, Any]:
+    """Track repeated action+outcome transitions and bounded fresh evidence."""
+    action = hashlib.sha256(
+        _canonical_action(step_result.get("code", "")).encode("utf-8")
+    ).hexdigest()
+    outcome = _outcome_signature(step_result, var_summaries)
+    repeated = (
+        action == state.get("last_action_signature")
+        and outcome == state.get("last_outcome_signature")
+    )
+
+    shown_images = [
+        image
+        for entry in step_result.get("show_images", [])
+        for image in entry.get("images", [])
+    ]
+    accepted_shown_images = shown_images
+    accepted_visual_fingerprints = list(
+        state.get("accepted_visual_evidence_fingerprints") or []
+    )
+    novel_visual_fingerprints: List[str] = []
+    if require_novel_visual_evidence:
+        excluded = set(initial_visual_fingerprints or [])
+        excluded.update(accepted_visual_fingerprints)
+        accepted_shown_images = []
+        for image in shown_images:
+            fingerprint = visual_fingerprint(image)
+            if fingerprint is None or fingerprint in excluded:
+                continue
+            excluded.add(fingerprint)
+            novel_visual_fingerprints.append(fingerprint)
+            accepted_shown_images.append(image)
+
+        # Pixel-novel output is progress even when the same code intentionally
+        # iterates through a sequence of different visual states.
+        if novel_visual_fingerprints and not step_result.get("error"):
+            repeated = False
+
+    # First-time inspection of an inline input image is loop progress even
+    # though it can never be novel override evidence (inline key frames are
+    # pre-registered as excluded). Without this, image-only samples starve
+    # under soft_step_limit because no visual action they can take counts.
+    # Scoped to non-video inputs: a video session can always earn genuine
+    # novel evidence by sampling new frames, so crediting inline re-looks
+    # there would only extend sessions past their measured step envelope.
+    credited_inline = list(state.get("credited_inline_fingerprints") or [])
+    inline_progress_fingerprints: List[str] = []
+    if (
+        require_novel_visual_evidence
+        and credit_inline_reinspection
+        and not step_result.get("error")
+        and not (state.get("input_metadata") or {}).get("is_video", False)
+    ):
+        initial_set = set(initial_visual_fingerprints or [])
+        seen_inline = set(credited_inline)
+        for image in shown_images:
+            fingerprint = visual_fingerprint(image)
+            if (
+                fingerprint is None
+                or fingerprint not in initial_set
+                or fingerprint in seen_inline
+            ):
+                continue
+            seen_inline.add(fingerprint)
+            inline_progress_fingerprints.append(fingerprint)
+        if inline_progress_fingerprints:
+            repeated = False
+
+    no_progress_count = (
+        int(state.get("no_progress_count", 0) or 0) + 1 if repeated else 0
+    )
+
+    summaries = list(state.get("evidence_summaries") or [])
+    evidence_images = list(state.get("evidence_images") or [])
+    evidence = _evidence_summary(
+        step_result,
+        var_summaries,
+        shown_images=accepted_shown_images,
+    )
+    has_novel_visual = bool(novel_visual_fingerprints)
+    new_evidence = bool(evidence) and not repeated and (
+        evidence not in summaries
+        or (require_novel_visual_evidence and has_novel_visual)
+    )
+    evidence_count = int(state.get("evidence_count", 0) or 0)
+    if new_evidence:
+        evidence_count += 1
+        summaries.append(evidence)
+        summaries = summaries[-2:]
+        if accepted_shown_images:
+            evidence_images = (evidence_images + accepted_shown_images)[-2:]
+        if require_novel_visual_evidence and novel_visual_fingerprints:
+            accepted_visual_fingerprints.extend(novel_visual_fingerprints)
+
+    updates = {
+        "last_action_signature": action,
+        "last_outcome_signature": outcome,
+        "no_progress_count": no_progress_count,
+        "new_evidence_last_step": (
+            bool(new_evidence) or bool(inline_progress_fingerprints)
+        ),
+        "evidence_count": evidence_count,
+        "evidence_summaries": summaries,
+        "evidence_images": evidence_images,
+    }
+    if require_novel_visual_evidence:
+        updates["accepted_visual_evidence_fingerprints"] = (
+            accepted_visual_fingerprints
+        )
+    if inline_progress_fingerprints:
+        updates["credited_inline_fingerprints"] = (
+            credited_inline + inline_progress_fingerprints
+        )
+    return updates
 
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
@@ -267,6 +507,36 @@ async def feedback_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
             var_summaries[name] = VariableTracker.format_summary(name, info)
     step_result["new_variables"] = var_summaries
 
+    # Record progress and evidence before checking ReturnAnswer so observations
+    # gathered in the answer-submission cell are available to the answer gate.
+    tracking_enabled = bool(
+        getattr(agent_config, "evidence_gated_override", False)
+        or getattr(agent_config, "reserve_final_answer_turn", False)
+        or getattr(
+            agent_config, "require_novel_visual_override_evidence", False
+        )
+        or int(state.get("no_progress_limit", 0) or 0) > 0
+        or int(state.get("soft_step_limit", 0) or 0) > 0
+    )
+    progress_updates = (
+        _progress_updates(
+            state,
+            step_result,
+            var_summaries,
+            require_novel_visual_evidence=getattr(
+                agent_config, "require_novel_visual_override_evidence", False
+            ),
+            initial_visual_fingerprints=cfg.get(
+                "initial_key_frame_fingerprints"
+            ),
+            credit_inline_reinspection=getattr(
+                agent_config, "credit_inline_reinspection", False
+            ),
+        )
+        if tracking_enabled
+        else {}
+    )
+
     # 6. Check for ReturnAnswer sentinel
     checklist = state.get("checklist", [])
     final_answer = await km.check_sentinel("_return_answer_result")
@@ -314,6 +584,7 @@ async def feedback_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
 
             condense = _maybe_condense(state, step_result, agent_config, logger)
             result = {
+                **progress_updates,
                 "messages": condense + [message],
                 "step_count": state["step_count"] + 1,
                 "total_show_images": prev_total + images_this_step,
@@ -351,8 +622,11 @@ async def feedback_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
             if compact:
                 feedback_text += "\n" + compact
 
-    # 6b. Warn the LLM on its last step before force-termination.
-    steps_remaining = state["max_steps"] - (state["step_count"] + 1)
+    # 6b. Warn the LLM on its last step before force-termination. When the
+    # final turn is reserved for the controller, the last EXECUTABLE loop turn
+    # is one earlier — warn then, or the warned turn never runs.
+    reserved_turns = 1 if state.get("reserve_final_answer_turn", False) else 0
+    steps_remaining = state["max_steps"] - (state["step_count"] + 1) - reserved_turns
     if steps_remaining <= 1:
         feedback_text += (
             "\n\n[LAST STEP] This is your final step. The session will be "
@@ -396,6 +670,15 @@ async def feedback_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
             "new_variables": list(new_vars.keys()),
             "changed_variables": list(changed_vars.keys()),
             "large_var_warnings": large_var_warnings,
+            "no_progress_count": progress_updates.get(
+                "no_progress_count", state.get("no_progress_count", 0)
+            ),
+            "new_evidence": progress_updates.get(
+                "new_evidence_last_step", False
+            ),
+            "evidence_count": progress_updates.get(
+                "evidence_count", state.get("evidence_count", 0)
+            ),
         })
 
     # Build message (multimodal if show images present)
@@ -408,6 +691,7 @@ async def feedback_node(state: AgentState, config: RunnableConfig) -> Dict[str, 
         message = HumanMessage(content=feedback_text)
 
     result = {
+        **progress_updates,
         "messages": condense + [message],
         "step_count": state["step_count"] + 1,
         "total_show_images": prev_total + images_this_step,

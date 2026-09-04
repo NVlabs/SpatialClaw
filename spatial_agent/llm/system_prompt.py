@@ -55,11 +55,14 @@ def build_system_prompt(
     key_frame_list_indices: Optional[List[int]] = None,
     key_frame_video_idx: Optional[List[int]] = None,
     num_ref_images: int = 0,
+    config: Optional[Any] = None,
 ) -> str:
     """Build the full system prompt for the main agent."""
-    from spatial_agent.config import get_config
+    if config is None:
+        # Preserve the historical public API for callers outside the workflow.
+        from spatial_agent.config import get_config
 
-    config = get_config()
+        config = get_config()
     ablations = config.prompt_section_ablations
     from spatial_agent.tools import ToolsModule
     all_sections = MAIN_PROMPT_SECTIONS | ToolsModule.get_all_tool_section_names()
@@ -250,6 +253,17 @@ def build_system_prompt(
             "2. Call `ReturnAnswer(...)` at the end to submit your final answer\n\n"
             "If you do not call `ReturnAnswer`, the system will force-terminate and guess.\n"
             "Do NOT leave analysis for a \"next step\" — there is none."
+        )
+    elif not getattr(config, "enable_planning", True):
+        _workflow_body = (
+            "## Workflow\n"
+            "First make a direct assessment from the images and question. "
+            "If the visible evidence is sufficient, submit your best answer immediately with "
+            "`ReturnAnswer(...)`.\n"
+            "- Use a tool or visual query only to resolve a specific missing fact that could change the answer.\n"
+            "- Prefer one targeted, informative action over broad exploration.\n"
+            "- Do not repeat an action when it produced no new information.\n"
+            "- Additional tool use or cross-validation is optional, not mandatory."
         )
     else:
         _workflow_body = (

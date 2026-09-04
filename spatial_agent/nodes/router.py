@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 
+from spatial_agent.llm.answer_policy import allowed_values, normalize_schema_answer
 from spatial_agent.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -38,21 +39,110 @@ def should_continue(state: AgentState) -> str:
     """Determine the next node: continue, force terminate, or end.
 
     Returns:
-        One of 'llm_step_node', 'force_terminate', or END.
+        One of 'llm_step_node', 'final_answer_node', 'force_terminate', or END.
     """
     if state.get("final_answer") is not None:
         return END
 
+    # An explicit outer inference deadline is not a server-discovery failure.
+    # Scoped policies terminate from existing evidence (or a deterministic
+    # schema fallback) instead of spending another full deadline on the sample.
+    if (
+        state.get("finalize_on_llm_timeout", False)
+        and state.get("llm_generation_timed_out", False)
+    ):
+        return "final_answer_node"
+
+    # Reserve the final budget unit for deterministic controller selection.
+    if (
+        state.get("reserve_final_answer_turn", False)
+        and state["step_count"] >= max(0, state["max_steps"] - 1)
+    ):
+        return "final_answer_node"
+
     if state["step_count"] >= state["max_steps"]:
+        if state.get("direct_candidate") is not None:
+            return "final_answer_node"
         return "force_terminate"
 
     if state["failure_count"] >= state["max_failures"]:
+        if state.get("direct_candidate") is not None:
+            return "final_answer_node"
         return "force_terminate"
 
     if state["max_tool_calls"] > 0 and state["total_tool_calls"] >= state["max_tool_calls"]:
+        if state.get("direct_candidate") is not None:
+            return "final_answer_node"
         return "force_terminate"
 
+    if _is_no_progress(state):
+        return "final_answer_node"
+
+    soft_limit = int(state.get("soft_step_limit", 0) or 0)
+    if (
+        soft_limit > 0
+        and state["step_count"] >= soft_limit
+        and not state.get("new_evidence_last_step", False)
+    ):
+        return "final_answer_node"
+
     return "llm_step_node"
+
+
+def after_direct_answer(state: AgentState) -> str:
+    """Route a direct-anchor deadline without launching another model call."""
+    if (
+        state.get("finalize_on_llm_timeout", False)
+        and state.get("llm_generation_timed_out", False)
+    ):
+        return "final_answer_node"
+    return "plan_node"
+
+
+def after_plan(state: AgentState) -> str:
+    """Terminate a scoped sample when its planner exhausted the LLM budget."""
+    if (
+        state.get("finalize_on_llm_timeout", False)
+        and state.get("llm_generation_timed_out", False)
+    ):
+        return "final_answer_node"
+    return "llm_step_node"
+
+
+def _is_no_progress(state: AgentState) -> bool:
+    """True after the configured number of repeated action+outcome pairs."""
+    limit = int(state.get("no_progress_limit", 0) or 0)
+    return limit > 0 and int(state.get("no_progress_count", 0) or 0) >= limit
+
+
+def controller_trigger_reason(state: AgentState) -> str:
+    """Return the controller/escape condition using router priority order."""
+    if (
+        state.get("finalize_on_llm_timeout", False)
+        and state.get("llm_generation_timed_out", False)
+    ):
+        return "llm_generation_timeout"
+    if (
+        state.get("reserve_final_answer_turn", False)
+        and state["step_count"] >= max(0, state["max_steps"] - 1)
+    ):
+        return "reserved_final"
+    if state["step_count"] >= state["max_steps"]:
+        return "max_steps"
+    if state["failure_count"] >= state["max_failures"]:
+        return "max_failures"
+    if state["max_tool_calls"] > 0 and state["total_tool_calls"] >= state["max_tool_calls"]:
+        return "max_tool_calls"
+    if _is_no_progress(state):
+        return "no_progress"
+    soft_limit = int(state.get("soft_step_limit", 0) or 0)
+    if (
+        soft_limit > 0
+        and state["step_count"] >= soft_limit
+        and not state.get("new_evidence_last_step", False)
+    ):
+        return "soft_step_limit"
+    return "unknown"
 
 
 async def force_terminate(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
@@ -70,22 +160,29 @@ async def force_terminate(state: AgentState, config: RunnableConfig) -> Dict[str
     safe_multimodal_fallback = bool(
         getattr(agent_config, "safe_multimodal_fallback", False)
     )
+    controller_policy = bool(agent_config) and any((
+        getattr(agent_config, "direct_answer_anchor", False),
+        getattr(agent_config, "evidence_gated_override", False),
+        getattr(agent_config, "reserve_final_answer_turn", False),
+    ))
 
     # Determine reason
-    reason = "unknown"
-    if state["step_count"] >= state["max_steps"]:
-        reason = "max_steps"
-    elif state["failure_count"] >= state["max_failures"]:
-        reason = "max_failures"
-    elif state["max_tool_calls"] > 0 and state["total_tool_calls"] >= state["max_tool_calls"]:
-        reason = "max_tool_calls"
+    reason = controller_trigger_reason(state)
 
     # ── Use last submitted answer if available (e.g. rejected by reflection) ──
     partial_answer = ""
     fallback_method = "none"
 
+    direct_candidate = normalize_schema_answer(
+        state.get("direct_candidate"), state.get("answer_schema")
+    )
+    if controller_policy and direct_candidate is not None:
+        partial_answer = direct_candidate
+        fallback_method = "direct_anchor"
+        logger.info("Using direct answer anchor: %s", partial_answer[:200])
+
     last_submitted = state.get("last_submitted_answer")
-    if last_submitted and last_submitted.get("raw_value"):
+    if not partial_answer and last_submitted and last_submitted.get("raw_value") is not None:
         partial_answer = str(last_submitted["raw_value"])
         fallback_method = "last_submitted"
         logger.info("Using last submitted answer: %s", partial_answer[:200])
@@ -123,6 +220,17 @@ async def force_terminate(state: AgentState, config: RunnableConfig) -> Dict[str
             safe_multimodal_fallback=safe_multimodal_fallback,
         )
         fallback_method = fallback_method or "regex"
+
+    if controller_policy:
+        schema_value = normalize_schema_answer(
+            partial_answer, state.get("answer_schema")
+        )
+        if schema_value is not None:
+            partial_answer = schema_value
+        else:
+            declared = allowed_values(state.get("answer_schema"))
+            partial_answer = declared[0] if declared else ""
+            fallback_method = f"{fallback_method}_schema_default"
 
     # Checklist stats for post-hoc analysis
     checklist = state.get("checklist", [])

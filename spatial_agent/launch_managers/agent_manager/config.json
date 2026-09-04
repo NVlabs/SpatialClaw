@@ -14,5 +14,11 @@
     },
     "cot_default_concurrency": 32,
     "cot_default_max_frames": 32,
-    "cot_default_system_prompt": "cot"
+    "cot_default_system_prompt": "cot",
+    "service_lifecycle_enabled": false,
+    "service_readiness_timeout_minutes": 240,
+    "service_running_readiness_timeout_minutes": 15,
+    "evaluator_pending_wait_minutes": 15,
+    "service_renewal_heartbeat_ttl_minutes": 5,
+    "service_finalize_timeout_minutes": 5
 }
