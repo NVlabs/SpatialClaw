@@ -1,0 +1,75 @@
+{
+    "llm_model": "cosmos3-nano",
+    "llm_base_url": "vllm",
+    "llm_api_key": "bearer",
+    "model_profile": "cosmos3-nano-loop-only",
+    "lock_llm_model": true,
+    "explicit_planner_frame_mapping": true,
+    "safe_multimodal_fallback": true,
+    "offload_multimodal_encoding": true,
+    "normalize_answer_symbols": true,
+    "record_input_fingerprints": true,
+    "cot_frame_preparation": "spatial-agent",
+    "enable_planning": false,
+    "executor_type": "code",
+    "direct_answer_anchor": false,
+    "evidence_gated_override": false,
+    "restrict_adjudicator_to_candidates": false,
+    "require_novel_visual_override_evidence": false,
+    "adjudicate_when_no_evidence": false,
+    "credit_inline_reinspection": false,
+    "accept_bare_letter_answers": true,
+    "robust_embedded_choice_schema": true,
+    "reserve_final_answer_turn": true,
+    "max_steps": 10,
+    "max_failures": 4,
+    "no_progress_limit": 2,
+    "soft_step_limit": 5,
+    "llm_sdk_max_retries": 0,
+    "llm_timeout_retries": 1,
+    "finalize_on_llm_timeout": true,
+    "llm_request_timeout_sec": 600,
+    "vlm_request_timeout_sec": 600,
+    "roles": {
+        "main": {
+            "max_tokens": 4096,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "repetition_penalty": 1.05
+        },
+        "planning": {
+            "max_tokens": 131072,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "general": {
+            "max_tokens": 4096,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "repetition_penalty": 1.05
+        },
+        "direct_answer": {
+            "max_tokens": 4096,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20,
+            "repetition_penalty": 1.05,
+            "enable_thinking": false
+        },
+        "vlm": {
+            "max_tokens": 32768,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        },
+        "vlm_grounding": {
+            "max_tokens": 16384,
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+        }
+    }
+}
