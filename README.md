@@ -30,6 +30,15 @@
 
 ---
 
+## News
+
+- 🚀 **2026-10-15 — NVIDIA Nemotron 3.5 Super VL:** SpatialClaw
+  contributed executable video-QA demonstrations for agentic vision
+  training. We thank the Nemotron team for the opportunity and
+  collaboration! **[Contribution, results, and citations →](docs/nemotron.md)**
+
+---
+
 > **TL;DR.** SpatialClaw is a **training-free** spatial reasoning framework that treats **code as the action interface**: a VLM-backed agent writes one Python cell per step into a persistent Jupyter kernel pre-loaded with perception primitives (SAM3 segmentation, Depth-Anything-3 reconstruction, geometry utilities) and scientific libraries (NumPy, SciPy, Matplotlib). Each cell can compose tool outputs, inspect intermediate evidence, and revise the analysis before committing an answer with `ReturnAnswer(...)`. Across **20 spatial reasoning benchmarks**, SpatialClaw reaches **59.9% average accuracy**, outperforming the prior best spatial agent by **+11.2 points** — with the **same** system prompt, tool set, and hyperparameters across all benchmarks and six VLM backbones (Qwen3.5/3.6, Gemma4) from 26B to 397B parameters.
 
 <details>
