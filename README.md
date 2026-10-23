@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/SpatialClaw/spatialclaw.github.io/main/static/images/icon.svg" width="120" alt="SpatialClaw logo" />
 
-# SpatialClaw
+# SpatialClaw (NeurIPS 2026)
 
 ### Rethinking the Action Interface for Agentic Spatial Reasoning
 
@@ -37,6 +37,8 @@
   training. We thank the Nemotron team for the opportunity and
   collaboration! **[Contribution, results, and citations →](docs/nemotron.md)**
 
+- 🎉 **2026-09-25 — NeurIPS 2026 acceptance announcement:** SpatialClaw is accepted at **NeurIPS 2026**! We also share expanded results with newer open-source and proprietary backbones, including **GPT-6 Astra**. **[Announcement](https://x.com/CMHungSteven/status/2104922895621165281)** · **[Expanded results →](#expanded-backbone-results)**
+
 ---
 
 > **TL;DR.** SpatialClaw is a **training-free** spatial reasoning framework that treats **code as the action interface**: a VLM-backed agent writes one Python cell per step into a persistent Jupyter kernel pre-loaded with perception primitives (SAM3 segmentation, Depth-Anything-3 reconstruction, geometry utilities) and scientific libraries (NumPy, SciPy, Matplotlib). Each cell can compose tool outputs, inspect intermediate evidence, and revise the analysis before committing an answer with `ReturnAnswer(...)`. Across **20 spatial reasoning benchmarks**, SpatialClaw reaches **59.9% average accuracy**, outperforming the prior best spatial agent by **+11.2 points** — with the **same** system prompt, tool set, and hyperparameters across all benchmarks and six VLM backbones (Qwen3.5/3.6, Gemma4) from 26B to 397B parameters.
@@ -51,6 +53,27 @@ Spatial reasoning — the ability to determine where objects are, how they relat
 </details>
 
 > 🔍 **What this repo contains.** This is the **official implementation** of the paper. It includes the full agent runtime (LangGraph workflow, persistent Jupyter kernel, AST safety check, planning/reflection loops), all 20 benchmark loaders, perception tool wrappers, a FastAPI-served GPU tool server, vLLM auto-discovery and load balancing, and the SLURM launch managers used to reproduce every experiment in the paper.
+
+---
+
+## Expanded Backbone Results
+
+> 📈 **Even GPT-6 Astra improves with SpatialClaw:** **71.3 → 77.4 (+6.1 points)**, with no additional training or model-specific tuning.
+
+Our expanded evaluation covers **11 backbones**, spanning open-source and proprietary models. **Every tested model improves its mean score** with SpatialClaw.
+
+Selected results below report the **equal-weight mean across 20 spatial reasoning benchmarks**, comparing **the same backbone without tools vs. with SpatialClaw**:
+
+| Backbone | Without tools (%) | With SpatialClaw (%) | Gain (points) |
+|:---------|------------------:|---------------------:|--------------:|
+| **GPT-6 Astra** | **71.3** | **77.4** | **+6.1** |
+| Opus 5 | 58.5 | 73.5 | +15.0 |
+| GPT-6 Sol | 61.2 | 72.9 | +11.7 |
+| Qwen3.8-27B | 59.8 | 67.3 | +7.5 |
+
+Gains are **absolute percentage points**, not relative improvements. These newer-backbone results extend the original paper evaluation summarized above.
+
+➡ **[Results announcement](https://x.com/CMHungSteven/status/2104922895621165281)** · **[Run SpatialClaw](#quickstart)** · **[Cite the paper](#citation)**
 
 ---
 
