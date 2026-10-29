@@ -38,6 +38,17 @@ Important:
 
 DIRECT_SYSTEM_PROMPT = ""
 
+# Identical to COT_SYSTEM_PROMPT except that the final-answer instruction
+# is format-agnostic, so yes/no and numeric benchmarks are not forced into a single letter.
+COT_FMT_SYSTEM_PROMPT = COT_SYSTEM_PROMPT.replace(
+    "a multiple-choice question about", "a question about"
+).replace(
+    "output your final answer as a single uppercase letter inside \\boxed{}, e.g. \\boxed{A}.",
+    "output your final answer inside \\boxed{} in the format the question asks for "
+    "(the option letter for multiple choice, yes or no, or a number with its unit).",
+)
+assert COT_FMT_SYSTEM_PROMPT != COT_SYSTEM_PROMPT
+
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -81,7 +92,7 @@ def _build_question(sample, benchmark, prompt_style: str = "cot") -> str:
     """Assemble the user-facing question text (question + choices)."""
     parts = [sample.question]
 
-    if prompt_style == "cot":
+    if prompt_style in ("cot", "cot_fmt"):
         parts.append("")
         parts.append(benchmark.data_specific_prompt)
 
@@ -96,7 +107,7 @@ def _build_question(sample, benchmark, prompt_style: str = "cot") -> str:
                 parts.append(f"{chr(65 + i)}. {text}")
 
     parts.append("")
-    if prompt_style == "cot":
+    if prompt_style in ("cot", "cot_fmt"):
         parts.append("Think step-by-step, then provide your final answer inside \\boxed{}.")
     else:
         parts.append("Answer with a single letter.")
@@ -209,8 +220,9 @@ def parse_args():
                         help="Deterministically subsample N random samples (seed=42). "
                              "Shortcut for --shuffle --limit N.")
     parser.add_argument("--system_prompt", type=str, default="cot",
-                        choices=["cot", "direct"],
-                        help="System prompt style: 'cot' (chain-of-thought) or 'direct' (single letter answer)")
+                        choices=["cot", "direct", "cot_fmt"],
+                        help="System prompt style: 'cot' (chain-of-thought, letter answer), 'direct' (single letter answer), "
+                             "'cot_fmt' (chain-of-thought, format-agnostic final answer)")
     return parser.parse_args()
 
 
@@ -310,7 +322,7 @@ async def main():
     llm_client = LLMClient(config)
 
     # ── system prompt ────────────────────────────────────────────────────
-    prompt_map = {"cot": COT_SYSTEM_PROMPT, "direct": DIRECT_SYSTEM_PROMPT}
+    prompt_map = {"cot": COT_SYSTEM_PROMPT, "direct": DIRECT_SYSTEM_PROMPT, "cot_fmt": COT_FMT_SYSTEM_PROMPT}
     active_prompt = prompt_map[args.system_prompt]
     print(f"System prompt: {args.system_prompt}")
 
