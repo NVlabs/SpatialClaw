@@ -56,6 +56,13 @@ BENCHMARK_REGISTRY: Dict[str, BenchmarkSpec] = {
     "perceptioncomp": BenchmarkSpec("spatial_agent.evals.perceptioncomp", "PerceptionCompBench", "PerceptionComp"),
     "videomme": BenchmarkSpec("spatial_agent.evals.videomme", "VideoMMEBench", "Video-MME"),
     "videommev2": BenchmarkSpec("spatial_agent.evals.videommev2", "VideoMMEv2Bench", "Video-MME-v2"),
+    # --- Benchmarks beyond the paper ---
+    # Cambrian-1 CV-Bench (2024, single image) — distinct from the 2025 video "cvbench" above.
+    "cvbench2024": BenchmarkSpec("spatial_agent.evals.cvbench2024", "CVBench2024", "CV-Bench-2024"),
+    "multihopspatial": BenchmarkSpec("spatial_agent.evals.multihopspatial", "MultihopSpatialBench", "MultihopSpatial"),
+    "spinbench": BenchmarkSpec("spatial_agent.evals.spinbench", "SpinBench", "SpinBench"),
+    "stibench": BenchmarkSpec("spatial_agent.evals.stibench", "STIBench", "STI-Bench"),
+    "spatialrgptbench": BenchmarkSpec("spatial_agent.evals.spatialrgptbench", "SpatialRGPTBench", "SpatialRGPT-Bench"),
     # --- Sentinel ---
     "none": BenchmarkSpec(None, None),
 }
