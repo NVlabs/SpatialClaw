@@ -281,6 +281,7 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
         _ansi_re = re.compile(r"\x1b\[[0-9;]*m")
         locate_count = sum(1 for q in vlm_queries if q.get("query_type") == "locate")
         thinking_count = sum(1 for q in vlm_queries if q.get("query_type") == "thinking")
+        point_count = sum(1 for q in vlm_queries if q.get("query_type") == "point")
         logger.log_step(state["session_id"], {
             "event_type": "execution",
             "step_index": state["step_count"],
@@ -292,6 +293,7 @@ async def execute_node(state: AgentState, config: RunnableConfig) -> Dict[str, A
             "vlm_queries_count": len(vlm_queries),
             "vlm_locate_count": locate_count,
             "vlm_thinking_count": thinking_count,
+            "vlm_point_count": point_count,
             "vlm_queries": vlm_queries,
             "execution_time_sec": result.execution_time_sec,
         })

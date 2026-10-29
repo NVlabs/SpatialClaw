@@ -49,7 +49,27 @@ Rules:
 """
 
 
-VISION_PROMPT_SECTIONS = {"locate_prompt", "thinking_prompt"}
+POINT_SYSTEM_PROMPT = """You are a visual pointing assistant. You are given ONE image and a description of a target: an object, a part of an object, or a free-space region.
+
+Output exactly one point that lies ON the target, as JSON on a single line:
+{"point_2d": [x, y]}
+with x and y integers on a 0-1000 grid of the image (x from left to right, y from top to bottom). Choose a point well inside the target — for a thin part or a small region, its middle — never on its boundary and never on a neighbouring object.
+
+If the target is not visible, or several candidates match and the description does not single one out, output {"point_2d": null} followed by one short line saying what you see instead. A refusal is a valid answer; a best-guess point on a similar-but-wrong object is not.
+"""
+
+
+VISION_PROMPT_SECTIONS = {"locate_prompt", "thinking_prompt", "point_prompt"}
+
+
+def get_point_system_prompt() -> str:
+    """Return the pointing system prompt, applying ablation overrides if configured."""
+    from spatial_agent.config import get_config
+    from spatial_agent.llm.prompt_common import resolve_section, warn_unknown_sections
+
+    ablations = get_config().prompt_section_ablations
+    warn_unknown_sections(ablations, VISION_PROMPT_SECTIONS, "vision prompt")
+    return resolve_section("point_prompt", POINT_SYSTEM_PROMPT, ablations)
 
 
 def get_locate_system_prompt() -> str:

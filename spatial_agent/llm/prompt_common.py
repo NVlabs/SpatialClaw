@@ -104,19 +104,21 @@ def build_input_description(metadata: Dict[str, Any]) -> str:
 
 def vlm_api_section(**_kwargs) -> str:
     """Return the VLM API documentation section."""
-    return """## Visual Access — `show`, `vlm.locate`, `vlm.ask_with_thinking`
+    return """## Visual Access — `show`, `vlm.locate`, `vlm.point`, `vlm.ask_with_thinking`
 
-You have three ways to obtain visual information:
+You have four ways to obtain visual information:
 
 - `show(visual_input)` — display image(s) inline in the next feedback so you can see them yourself.
-- `vlm.locate(visual_input, question)` → `str` — ask a grounding VLM for pixel coordinates of an object you describe. Up to 8 images per call.
+- `vlm.locate(visual_input, question)` → `str` — ask a grounding VLM for the coordinates (0-1000 normalized scale, returned as text) of an object you describe. Up to 8 images per call.
+- `vlm.point(image, description)` → `dict | None` — ask a pointing VLM for ONE point that lies on an object, a part of an object, or a free-space region you describe; the result is already in pixel coordinates of the image you passed: `{"x": px, "y": py, "x_norm": px/W, "y_norm": py/H, "raw": ...}`, or `None` if the target is not visible.
 - `vlm.ask_with_thinking(visual_input, question)` → `str` — ask a separate visual reasoner that deliberates over the provided frames and returns a text answer. Up to 64 images per call.
 
 ### Choosing a tool
 
 Each tool produces a particular shape of evidence:
 
-- `vlm.locate`             — pixel coordinates of an object you can describe in words.
+- `vlm.locate`             — 0-1000-scale coordinates of an object you can describe in words (centre or box, as text; convert with `tools.Geometry.normalized_to_pixel`).
+- `vlm.point`              — one point ON a described object / part / free region, in pixels, ready to use.
 - `tools.SAM3`             — per-frame masks given a point/box or text prompt.
 - `tools.Reconstruct`      — 3D geometry, depth, camera pose for a frame range.
 - `tools.Geometry`         — numeric ops on coordinates and arrays.
@@ -145,6 +147,14 @@ Estimating coordinates yourself by eye is unreliable — call `vlm.locate` for g
 
 `vlm.locate` may return the literal string `Not visible` (optionally followed by a short note) when the requested object/annotation is absent or ambiguous in the image. Always check for this before parsing the answer as coordinates; if you see it, try a different frame, refine the description, or first locate the target frame with `vlm.ask_with_thinking`.
 
+### Working with `vlm.point`
+
+When the answer itself is a location — the question asks you to point at, mark, or place something — obtain the point with `vlm.point` and submit THAT point, converted to the units the question asks for: `pt["x_norm"], pt["y_norm"]` for 0-1 normalized coordinates of the image you passed, `round(1000 * pt["x_norm"]), round(1000 * pt["y_norm"])` for a 0-1000 grid, or `pt["x"], pt["y"]` for pixels of that image (`pt["raw"]` is the model's unconverted text — do not submit it). Do not substitute a bounding-box centre or a mask centroid for it: those often fall off thin parts, off-centre targets and vacant regions, which is exactly where a point answer is judged.
+- Describe the target in words that single it out, including the spatial relation when the question gives one: `vlm.point(InputImages[0], "the handle of the kettle")`, `vlm.point(InputImages[0], "the empty shelf space to the right of the books")`.
+- For several points in a region, call it once per spot with distinct descriptions (e.g. "left part of ...", "right part of ...") or verify one point with `show()` and place the others around it inside the same region.
+- Check for `None` (target not visible / ambiguous) and refine the description or the frame if you get it.
+- Masks (`tools.SAM3`) remain the tool for extents, areas, counting and for feeding geometry; `vlm.locate` remains the way to get boxes for SAM3 prompts.
+
 ### Working with `vlm.ask_with_thinking`
 
 The session is independent: it sees only the images and the question you pass in. Do not write your prior conclusions, prior vlm answers, or expected answers into the question — phrase the question on its own terms so the answer is formed from the images.
@@ -159,7 +169,7 @@ Multiple consistent answers across calls are stronger evidence than a single cal
 
 ### Pitfalls
 
-- **NEVER** overwrite the `vlm` or `feedback` variables: `vlm = vlm.locate(...)` or `feedback = feedback.show(...)` destroys the module. Always assign to a different name: `coords = vlm.locate(...)`, `answer = vlm.ask_with_thinking(...)`."""
+- **NEVER** overwrite the `vlm` or `feedback` variables: `vlm = vlm.locate(...)` or `feedback = feedback.show(...)` destroys the module. Always assign to a different name: `coords = vlm.locate(...)`, `pt = vlm.point(...)`, `answer = vlm.ask_with_thinking(...)`."""
 
 
 def return_answer_section() -> str:

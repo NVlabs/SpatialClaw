@@ -8,16 +8,23 @@ history, no prior reasoning from the main agent.
   short answers, up to 8 images per call.
 - ``vlm.ask_with_thinking(visual_input, question)`` — visual reasoning
   with extended thinking budget, up to 64 frames per call.
+- ``vlm.point(image, description)``  — ONE point on a described object,
+  part or free-space region, returned in pixel coordinates of the image
+  (direct pointing instead of box-centre / mask-centroid proxies when the
+  answer itself is a point).
 
 Usage in the Jupyter kernel::
 
     coords = vlm.locate(InputImages[5], "Give the (x, y) center coordinates in 0-1000 normalized scale for the car. Reply with ONLY the numbers.")
     answer = vlm.ask_with_thinking([InputImages[0], InputImages[15], InputImages[30]], "Across these frames, does the person walk toward or away from the camera?")
+    pt = vlm.point(InputImages[0], "the handle of the blue mug")   # {"x": 412.3, "y": 288.0, "x_norm": 0.56, "y_norm": 0.52, "raw": "..."} or None
 """
 
 import asyncio
 import concurrent.futures
+import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from PIL import Image
@@ -40,6 +47,69 @@ _LOCATE_VERIFY_PREAMBLE = (
 )
 
 
+def _parse_point_answer(answer: Any) -> Optional[tuple]:
+    """Parse the pointing VLM's answer into normalized (x, y) in [0, 1].
+
+    Accepts ``{"point_2d": [x, y]}`` (fenced or bare JSON, also a one-element
+    list of such dicts), ``{"x": .., "y": ..}``, ``[x, y]`` / ``(x, y)`` / ``x y``
+    pairs. Values on the 0-1000 grid are divided by 1000; values already in
+    [0, 1] are taken as normalized. Returns None for null / "Not visible" /
+    unparsable answers.
+    """
+    if answer is None:
+        return None
+    s = str(answer).strip()
+    if not s or s.startswith("[VLM Error]"):
+        return None
+    low = s.lower()
+    # Explicit refusal: {"point_2d": null} / {'point_2d': None} with any spacing or line breaks, or "Not visible".
+    if re.search(r"point(?:_2d)?[\"']?\s*:\s*(?:null|none)\b", low) or low.startswith("not visible"):
+        return None
+    vals: Optional[List[float]] = None
+    json_seen = False
+    blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", s, re.DOTALL | re.IGNORECASE) or re.findall(r"(\[\s*\{.*?\}\s*\]|\{[^{}]*\})", s, re.DOTALL)
+    for b in blocks:
+        try:
+            data = json.loads(b.strip())
+        except json.JSONDecodeError:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            json_seen = True
+            if ("point_2d" in it or "point" in it) and it.get("point_2d", it.get("point")) is None:
+                return None  # an explicit null point is a refusal
+            v = it.get("point_2d", it.get("point"))
+            try:
+                if isinstance(v, (list, tuple)) and len(v) >= 2:
+                    vals = [float(v[0]), float(v[1])]
+                    break
+                if it.get("x") is not None and it.get("y") is not None:
+                    vals = [float(it["x"]), float(it["y"])]
+                    break
+            except (TypeError, ValueError):
+                return None
+        if vals:
+            break
+    if vals is None:
+        # A JSON answer without a point key (e.g. Qwen's {"bbox_2d": [...]}) or a long text is NOT a point: never
+        # fall back to the first two numbers in it. Only a short bare pair ("412 288", "(412, 288)", "[550, 900]"),
+        # optionally followed by one note line, is accepted without JSON.
+        if json_seen or len(s) > 300:
+            return None
+        m = re.match(r"^[\[\(]?\s*(-?\d+\.?\d*)\s*[,\s]\s*(-?\d+\.?\d*)\s*[\]\)]?\s*(?:$|\n)", s)
+        if not m:
+            return None
+        vals = [float(m.group(1)), float(m.group(2))]
+    x, y = vals
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        return (x, y)
+    if 0.0 <= x <= 1000.0 and 0.0 <= y <= 1000.0:
+        return (x / 1000.0, y / 1000.0)
+    return None
+
+
 class VLMModule:
     """Injected into the kernel as ``vlm``.
 
@@ -57,10 +127,12 @@ class VLMModule:
         session_id: str = "",
         locate_role_params=None,    # LLMRoleParams
         thinking_role_params=None,  # LLMRoleParams
+        point_system_prompt: str = "",
     ):
         self._llm_client = llm_client
         self._locate_prompt = locate_system_prompt
         self._thinking_prompt = thinking_system_prompt
+        self._point_prompt = point_system_prompt or locate_system_prompt
         self._session_dir = session_dir
         self._session_id = session_id
         self._locate_role_params = locate_role_params
@@ -125,6 +197,61 @@ class VLMModule:
             max_images=_THINKING_MAX_IMAGES,
         )
 
+    def point(
+        self,
+        image: Union[VisualFeedback, Image.Image, List],
+        description: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Ask the pointing VLM for ONE point on a described target.
+
+        Args:
+            image: a single VisualFeedback / PIL.Image (a list is accepted; only
+                its first image is used, with a printed note).
+            description: what to point at — an object, a part of an object, or a
+                free-space region, in words (e.g. "the handle of the blue mug",
+                "the empty table surface left of the bowl").
+
+        Returns:
+            ``{"x": px, "y": py, "x_norm": xn, "y_norm": yn, "raw": answer}`` with
+            ``(px, py)`` in PIXEL coordinates of the image you passed and
+            ``(xn, yn)`` the same point divided by the image width / height, or
+            ``None`` when the target is not visible / ambiguous or the answer
+            could not be parsed (the raw answer is printed either way).
+        """
+        imgs = self._resolve_images(image)
+        if len(imgs) > 1:
+            print(f"[vlm.point] {len(imgs)} images given; pointing on the first one only.")
+        img = imgs[0]
+        question = (
+            f"Target: {description}\n"
+            "Output exactly one point that lies ON the target as JSON on a single line: "
+            '{"point_2d": [x, y]} with x and y on a 0-1000 grid of the image '
+            "(x from left to right, y from top to bottom). If the target is not visible "
+            'or ambiguous, output {"point_2d": null} and one short line saying what you see instead.'
+        )
+        answer = self._dispatch(
+            visual_input=img,
+            question=question,
+            query_type="point",
+            system_prompt=self._point_prompt,
+            role_params=self._locate_role_params,
+            max_images=1,
+            source_desc=(
+                str(image)
+                if not isinstance(image, list)
+                else f"first of a list of {len(image)} images: {image[0]!s}"
+            ),
+        )
+        parsed = _parse_point_answer(answer)
+        if parsed is None:
+            print(f"[vlm.point] no point for '{description}' (answer: {str(answer)[:120]!r})")
+            return None
+        xn, yn = parsed
+        w, h = img.size
+        result = {"x": xn * w, "y": yn * h, "x_norm": xn, "y_norm": yn, "raw": answer}
+        print(f"[vlm.point] '{description}' -> pixel ({result['x']:.1f}, {result['y']:.1f}) of a {w}x{h} image")
+        return result
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -137,6 +264,7 @@ class VLMModule:
         system_prompt: str,
         role_params,
         max_images: int,
+        source_desc: Optional[str] = None,
     ) -> str:
         self._query_counter += 1
         query_id = f"vlm_q_{query_type}_{self._query_counter:04d}"
@@ -179,11 +307,12 @@ class VLMModule:
         except Exception as exc:
             answer = f"[VLM Error] {exc}"
 
-        source_desc = (
-            str(visual_input)
-            if not isinstance(visual_input, list)
-            else f"list of {len(visual_input)} images"
-        )
+        if source_desc is None:
+            source_desc = (
+                str(visual_input)
+                if not isinstance(visual_input, list)
+                else f"list of {len(visual_input)} images"
+            )
         self._queries.append(
             {
                 "query_id": query_id,

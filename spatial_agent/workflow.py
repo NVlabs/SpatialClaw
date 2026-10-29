@@ -19,6 +19,7 @@ from spatial_agent.llm.react_prompt import build_react_system_prompt
 from spatial_agent.llm.system_prompt import build_system_prompt
 from spatial_agent.llm.vision_prompt import (
     get_locate_system_prompt,
+    get_point_system_prompt,
     get_thinking_system_prompt,
 )
 from spatial_agent.logging_utils.logger import SessionLogger
@@ -353,6 +354,7 @@ class SpatialAgentWorkflow:
             session_id=session_id,
             locate_role_params=self.config.vlm_grounding_params,
             thinking_role_params=self.config.vlm_params,
+            point_system_prompt=get_point_system_prompt(),
         )
 
         # In multi-video mode SAM3 receives both the per-video InputImages list

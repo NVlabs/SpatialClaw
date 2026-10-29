@@ -425,12 +425,15 @@ def _step_card(step_idx: int, events: List[Dict], session_dir: str) -> str:
         if vc > 0:
             loc = ve.get("vlm_locate_count", 0)
             thi = ve.get("vlm_thinking_count", 0)
+            poi = ve.get("vlm_point_count", 0)
             breakdown = []
             if loc:
                 breakdown.append(f"{loc} locate")
             if thi:
                 breakdown.append(f"{thi} thinking")
-            other = vc - loc - thi
+            if poi:
+                breakdown.append(f"{poi} point")
+            other = vc - loc - thi - poi
             if other:
                 breakdown.append(f"{other} other")
             label = f"{vc} ({', '.join(breakdown)})" if breakdown else str(vc)
@@ -452,7 +455,7 @@ def _step_card(step_idx: int, events: List[Dict], session_dir: str) -> str:
                 parts.append(f'<p><em>Q:</em> {_escape(str(question))}</p>')
                 parts.append(f'<p><em>A:</em> {_escape(str(answer))}</p>')
                 # Render any saved images for this query
-                if qtype in ("locate", "thinking") and qid:
+                if qtype in ("locate", "thinking", "point") and qid:
                     qdir = os.path.join(vlm_dir, qtype)
                     if os.path.isdir(qdir):
                         img_paths = sorted(

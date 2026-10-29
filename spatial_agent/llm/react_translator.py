@@ -23,7 +23,7 @@ from typing import Any, Dict
 
 
 ALLOWED_TOOL_PREFIXES = ("tools.",)
-ALLOWED_FULL_NAMES = {"vlm.locate", "vlm.ask_with_thinking", "ReturnAnswer", "show"}
+ALLOWED_FULL_NAMES = {"vlm.locate", "vlm.point", "vlm.ask_with_thinking", "ReturnAnswer", "show"}
 
 
 _LITERAL_AST_NODES = (
