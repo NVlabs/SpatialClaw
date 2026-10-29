@@ -67,6 +67,13 @@ BENCHMARK_REGISTRY: Dict[str, BenchmarkSpec] = {
     "spatialiq": BenchmarkSpec("spatial_agent.evals.spatialiq", "SpatialIQBench", "Spatial-IQ"),
     "pixmocount": BenchmarkSpec("spatial_agent.evals.pixmocount", "PixMoCountBench", "PixMo-Count"),
     "countqa": BenchmarkSpec("spatial_agent.evals.countqa", "CountQABench", "CountQA"),
+    # single-image 3D spatial-reasoning MCQ
+    "3dsrbench": BenchmarkSpec("spatial_agent.evals.dsrbench3d", "DSRBench3D", "3DSRBench"),
+    "crosspointbench": BenchmarkSpec("spatial_agent.evals.crosspointbench", "CrossPointBench", "CrossPoint-Bench"),
+    # pointing suite
+    "refspatialbench": BenchmarkSpec("spatial_agent.evals.refspatialbench", "RefSpatialBench", "RefSpatial-Bench"),
+    "robospatialhome": BenchmarkSpec("spatial_agent.evals.robospatialhome", "RoboSpatialHome", "RoboSpatial-Home"),
+    "where2place": BenchmarkSpec("spatial_agent.evals.where2place", "Where2Place", "Where2Place"),
     # --- Sentinel ---
     "none": BenchmarkSpec(None, None),
 }

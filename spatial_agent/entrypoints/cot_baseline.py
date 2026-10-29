@@ -287,6 +287,10 @@ async def main():
 
     set_config(config)
 
+    # Point-benchmark scorers invert the crop+resize of THIS arm (evals/crosspointbench.shown_frame): the no-tool
+    # arm shows resize_for_input_images frames, i.e. the Pi3 grid. An explicit environment value wins.
+    os.environ.setdefault("SPATIAL_AGENT_SHOWN_GRID", "pi3")
+
     # ── benchmark ───────────────────────────────────────────────────────
     from spatial_agent.evals.factory import BenchmarkFactory
 

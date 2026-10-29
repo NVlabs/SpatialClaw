@@ -154,6 +154,13 @@ async def main():
 
     set_config(config)
 
+    # Point-benchmark scorers invert the InputImages crop+resize of THIS arm (evals/crosspointbench.shown_frame);
+    # the agent shows frames resized with resize_for_input_images_for_backend(..., config.reconstruct_backend):
+    # "da3" -> DA3 target aspects, anything else -> the Pi3 grid. An explicit environment value wins.
+    os.environ.setdefault(
+        "SPATIAL_AGENT_SHOWN_GRID", "da3" if str(config.reconstruct_backend).lower() == "da3" else "pi3"
+    )
+
     from spatial_agent.evals.factory import BenchmarkFactory
     benchmark = BenchmarkFactory.create_benchmark(
         config.benchmark, question_type=config.question_type
