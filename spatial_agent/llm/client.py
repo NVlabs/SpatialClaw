@@ -48,6 +48,18 @@ _UNHEALTHY_COOLDOWN_SEC = 60.0
 # Startup health check timeout per endpoint
 _HEALTH_CHECK_TIMEOUT_SEC = 3
 
+# Request cap. Unset -> default behaviour: the harness waits 600 s
+# (main path) / config.vlm_query_timeout_sec (VLM path) and the OpenAI SDK keeps its own defaults
+# (600 s timeout, 2 internal retries). SPATIAL_AGENT_REQUEST_TIMEOUT_SEC overrides BOTH the harness
+# wait and the SDK timeout so a long generation is not killed by the SDK; SPATIAL_AGENT_SDK_MAX_RETRIES
+# overrides the SDK's internal retry count (the harness already retries 5x at the outer level).
+_REQUEST_TIMEOUT_ENV = os.environ.get("SPATIAL_AGENT_REQUEST_TIMEOUT_SEC")
+_SDK_MAX_RETRIES_ENV = os.environ.get("SPATIAL_AGENT_SDK_MAX_RETRIES")
+
+
+def _request_timeout(default_sec: float) -> float:
+    return float(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_ENV else float(default_sec)
+
 
 def image_to_base64_url(img: Image.Image, max_size: int = 1024) -> str:
     """Encode a PIL image as a base64 data URI, resizing if needed."""
@@ -361,9 +373,15 @@ class LLMClient:
         """Get or create a pooled AsyncOpenAI client for the endpoint."""
         client = self._client_pool.get(endpoint)
         if client is None:
+            sdk_kwargs = {}
+            if _REQUEST_TIMEOUT_ENV:
+                sdk_kwargs["timeout"] = float(_REQUEST_TIMEOUT_ENV)
+            if _SDK_MAX_RETRIES_ENV is not None:
+                sdk_kwargs["max_retries"] = int(_SDK_MAX_RETRIES_ENV)
             client = AsyncOpenAI(
                 api_key=self._api_key,
                 base_url=endpoint,
+                **sdk_kwargs,
             )
             self._client_pool[endpoint] = client
         return client
@@ -586,7 +604,7 @@ class LLMClient:
                             messages=messages,
                             **api_kwargs,
                         ),
-                        timeout=600,
+                        timeout=_request_timeout(600),
                     )
                 except self._RETRYABLE_ERRORS as exc:
                     last_exc = exc
@@ -723,7 +741,7 @@ class LLMClient:
                             messages=messages,
                             **api_kwargs,
                         ),
-                        timeout=self.config.vlm_query_timeout_sec,
+                        timeout=_request_timeout(self.config.vlm_query_timeout_sec),
                     )
                 except self._RETRYABLE_ERRORS as exc:
                     last_exc = exc
