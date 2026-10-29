@@ -325,26 +325,26 @@ def extract_video_frames(
     ffmpeg = _find_ffmpeg()
     fps, total, duration = _probe_video_meta(ffmpeg, video_path)
 
-    # Determine output fps
-    if video_max_fps and fps > video_max_fps:
-        out_fps = video_max_fps
-    else:
-        out_fps = fps
+    # Determine output fps. Re-time the stream ONLY when a cap is requested. Without a cap every stored frame is
+    # emitted exactly once (``-vsync 0`` = passthrough): an ``fps=<native>`` filter is not the identity for
+    # fractional-rate videos — ffmpeg reports the rate with two decimals (e.g. 0.18 for 40/227 fps), and over a
+    # 32-frame clip that rounding error duplicates or drops a stored frame.
+    cap = bool(video_max_fps) and fps > video_max_fps
+    out_fps = video_max_fps if cap else fps
 
     # Extract frames via ffmpeg
-    vf_filters = [f"fps={out_fps}"]
+    vf_filters = [f"fps={out_fps}"] if cap else []
     if video_frame_resize_short_edge:
         se = video_frame_resize_short_edge
         vf_filters.append(
             f"scale='if(lte(iw,ih),{se},-2)':'if(lte(iw,ih),-2,{se})'"
         )
-    cmd = [
-        ffmpeg, "-v", "error",
-        "-i", video_path,
-        "-vf", ",".join(vf_filters),
-        "-q:v", "2",
-        os.path.join(cache_dir, "frame_%06d.jpg"),
-    ]
+    cmd = [ffmpeg, "-v", "error", "-i", video_path]
+    if not cap:
+        cmd += ["-vsync", "0"]
+    if vf_filters:
+        cmd += ["-vf", ",".join(vf_filters)]
+    cmd += ["-q:v", "2", os.path.join(cache_dir, "frame_%06d.jpg")]
     subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
     # Collect results
@@ -353,9 +353,12 @@ def extract_video_frames(
     )
     frame_paths = [os.path.join(cache_dir, fn) for fn in frame_files]
 
-    # Compute original frame indices from output fps
-    step = fps / out_fps
-    frame_indices = [int(round(i * step)) for i in range(len(frame_files))]
+    # Original frame indices: identity for passthrough, re-timed by the fps ratio when capped
+    if cap:
+        step = fps / out_fps
+        frame_indices = [int(round(i * step)) for i in range(len(frame_files))]
+    else:
+        frame_indices = list(range(len(frame_files)))
 
     if not frame_paths:
         print(f"[Warning] No frames extracted from {video_path}")
