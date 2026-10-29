@@ -63,6 +63,10 @@ BENCHMARK_REGISTRY: Dict[str, BenchmarkSpec] = {
     "spinbench": BenchmarkSpec("spatial_agent.evals.spinbench", "SpinBench", "SpinBench"),
     "stibench": BenchmarkSpec("spatial_agent.evals.stibench", "STIBench", "STI-Bench"),
     "spatialrgptbench": BenchmarkSpec("spatial_agent.evals.spatialrgptbench", "SpatialRGPTBench", "SpatialRGPT-Bench"),
+    # single-image integer-answer benchmarks
+    "spatialiq": BenchmarkSpec("spatial_agent.evals.spatialiq", "SpatialIQBench", "Spatial-IQ"),
+    "pixmocount": BenchmarkSpec("spatial_agent.evals.pixmocount", "PixMoCountBench", "PixMo-Count"),
+    "countqa": BenchmarkSpec("spatial_agent.evals.countqa", "CountQABench", "CountQA"),
     # --- Sentinel ---
     "none": BenchmarkSpec(None, None),
 }
