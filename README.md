@@ -123,6 +123,7 @@ python -m spatial_agent.entrypoints.run \
 | ⚙️ [Configuration](docs/configuration.md) | Model / dataset JSON configs, env-var overrides, supported benchmarks |
 | 🧠 [Architecture](docs/architecture.md) | Agentic loop, three-service runtime, directory structure |
 | 🛠️ [Troubleshooting](docs/troubleshooting.md) | Common errors and fixes |
+| 📈 [Results beyond the paper](docs/benchmarks_beyond_paper.md) | Additional benchmarks where SpatialClaw beats a no-tool CoT baseline of the same model on the same items, and where the gains come from |
 
 ---
 
@@ -139,6 +140,8 @@ All 20 paper benchmarks ship as ready-to-run dataset configs under `spatial_agen
 | General video understanding       | CV-Bench, PerceptComp, Video-MME, Video-MME-v2                       |
 
 Details and per-benchmark loaders: **[docs/configuration.md](docs/configuration.md#supported-benchmarks)**.
+
+Beyond the paper, SpatialClaw improves over a no-tool baseline of the same model on further benchmarks (CrossPoint-Bench, SpatialRGPT-Bench, ReVSI, CountQA, Spatial-IQ, SpinBench, PixMo-Count, Where2Place, MultihopSpatial): see **[docs/benchmarks_beyond_paper.md](docs/benchmarks_beyond_paper.md)**.
 
 ---
 
