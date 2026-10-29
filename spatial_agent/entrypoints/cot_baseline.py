@@ -132,6 +132,8 @@ async def worker(
 ):
     async with semaphore:
         sid = sample.sample_id
+        timeout_rounds = 0      # consecutive request-timeout rounds (see below)
+        timeout_giveup = False
         try:
             # Ensure video frames are extracted (VLM4D lazy loading)
             if hasattr(sample, "ensure_frames_loaded"):
@@ -149,12 +151,19 @@ async def worker(
 
             question = _build_question(sample, benchmark, prompt_style=prompt_style)
 
-            # Single VLM call — retry indefinitely on server unavailability
+            # Single VLM call — retry indefinitely on server unavailability.
+            # When SPATIAL_AGENT_COT_TIMEOUT_GIVEUP_ROUNDS > 0, an
+            # item whose request keeps hitting the request cap (APITimeoutError / asyncio.TimeoutError: the server
+            # is up but the generation never finishes) is recorded as a FAILURE (empty content) after that many
+            # client rounds instead of being re-sampled forever. Connection errors (server down) still wait.
+            # Default 0 = never give up (keep re-sampling).
             from openai import APIConnectionError, APITimeoutError
             _server_errors = (
                 asyncio.TimeoutError, ConnectionError, OSError,
                 APIConnectionError, APITimeoutError,
             )
+            _timeout_errors = (asyncio.TimeoutError, APITimeoutError)
+            _giveup_rounds = int(os.environ.get("SPATIAL_AGENT_COT_TIMEOUT_GIVEUP_ROUNDS", "0") or 0)
             while True:
                 try:
                     answer_text = await llm_client.generate_vision_query(
@@ -167,6 +176,17 @@ async def worker(
                     )
                     break
                 except _server_errors as exc:
+                    if isinstance(exc, _timeout_errors) and _giveup_rounds > 0:
+                        # The client (same env) has already re-sampled this call for _giveup_rounds rounds of
+                        # 5 attempts before raising a timeout; record the item as a failure.
+                        timeout_rounds = _giveup_rounds
+                        print(
+                            f"[Giveup] Sample {sid}: request cap hit in {timeout_rounds} client rounds "
+                            f"-> recorded as a failure"
+                        )
+                        answer_text = ""
+                        timeout_giveup = True
+                        break
                     print(
                         f"[Wait] Sample {sid}: server unavailable ({type(exc).__name__}), "
                         f"retrying in 30s..."
@@ -185,6 +205,9 @@ async def worker(
             predictions[sid] = extracted
             gt = getattr(sample, "answer", None)
             entry = {"sample_id": str(sid), "content": answer_text, "extracted": extracted}
+            if timeout_giveup:
+                entry["_timeout_giveup"] = True      # scored as wrong, not retried
+                entry["_timeout_rounds"] = timeout_rounds
             if gt is not None:
                 entry["ground_truth"] = str(gt)
             result = benchmark.evaluate_single(sample, extracted)

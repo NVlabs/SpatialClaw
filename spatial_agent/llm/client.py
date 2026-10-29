@@ -55,6 +55,15 @@ _HEALTH_CHECK_TIMEOUT_SEC = 3
 # overrides the SDK's internal retry count (the harness already retries 5x at the outer level).
 _REQUEST_TIMEOUT_ENV = os.environ.get("SPATIAL_AGENT_REQUEST_TIMEOUT_SEC")
 _SDK_MAX_RETRIES_ENV = os.environ.get("SPATIAL_AGENT_SDK_MAX_RETRIES")
+# Request-cap timeouts (TimeoutError / APITimeoutError) are classified as
+# "server unreachable" below and re-sampled inside the 4-h server-wait loop. When SPATIAL_AGENT_COT_TIMEOUT_GIVEUP_ROUNDS
+# > 0, a call whose quick-retry round ends in a timeout that many times in a row raises instead, so the caller can record
+# the item as a failure. Default 0 = never give up (keep re-sampling).
+_TIMEOUT_GIVEUP_ROUNDS = int(os.environ.get("SPATIAL_AGENT_COT_TIMEOUT_GIVEUP_ROUNDS", "0") or 0)
+
+
+def _is_timeout(exc: Optional[BaseException]) -> bool:
+    return isinstance(exc, (asyncio.TimeoutError, TimeoutError, APITimeoutError))
 
 
 def _request_timeout(default_sec: float) -> float:
@@ -588,6 +597,7 @@ class LLMClient:
         await self._maybe_rediscover()
 
         wait_start: Optional[float] = None
+        timeout_rounds = 0  # consecutive request-timeout rounds
 
         while True:
             last_exc: Optional[Exception] = None
@@ -664,6 +674,15 @@ class LLMClient:
             if not is_connection_failure:
                 raise last_exc  # type: ignore[misc]
 
+            # A round that ended in a request-cap timeout counts; give up after the configured number of rounds
+            timeout_rounds = (timeout_rounds + 1) if _is_timeout(last_exc) else 0
+            if _TIMEOUT_GIVEUP_ROUNDS > 0 and timeout_rounds >= _TIMEOUT_GIVEUP_ROUNDS:
+                logger.error(
+                    "[LLMClient] Request cap hit in %d consecutive rounds (%d attempts each) -> giving up on this call.",
+                    timeout_rounds, max_retries,
+                )
+                raise last_exc  # type: ignore[misc]
+
             # Enforce server-wait timeout
             if wait_start is None:
                 wait_start = time.monotonic()
@@ -725,6 +744,7 @@ class LLMClient:
 
         max_retries = 5
         wait_start: Optional[float] = None
+        timeout_rounds = 0  # consecutive request-timeout rounds
 
         while True:
             last_exc: Optional[Exception] = None
@@ -800,6 +820,15 @@ class LLMClient:
 
             # All quick retries exhausted
             if not is_connection_failure:
+                raise last_exc  # type: ignore[misc]
+
+            # A round that ended in a request-cap timeout counts; give up after the configured number of rounds
+            timeout_rounds = (timeout_rounds + 1) if _is_timeout(last_exc) else 0
+            if _TIMEOUT_GIVEUP_ROUNDS > 0 and timeout_rounds >= _TIMEOUT_GIVEUP_ROUNDS:
+                logger.error(
+                    "[LLMClient] VLM request cap hit in %d consecutive rounds (%d attempts each) -> giving up on this call.",
+                    timeout_rounds, max_retries,
+                )
                 raise last_exc  # type: ignore[misc]
 
             # Enforce server-wait timeout
