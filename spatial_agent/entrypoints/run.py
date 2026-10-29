@@ -33,6 +33,9 @@ def parse_args():
     parser.add_argument("--llm_model", type=str, default=None)
     parser.add_argument("--llm_base_url", type=str, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--timeout_sec", type=int, default=None,
+                        help="Per-cell execution cap in seconds (config.timeout_sec, default 600). "
+                             "Set it to the request cap so an in-kernel VLM query is not cut by the cell.")
     parser.add_argument("--sample_ids", nargs="+", default=None)
     parser.add_argument("--executor_type", type=str, default=None,
                         choices=["code", "react", "single_pass"],
