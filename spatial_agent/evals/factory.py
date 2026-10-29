@@ -74,6 +74,8 @@ BENCHMARK_REGISTRY: Dict[str, BenchmarkSpec] = {
     "refspatialbench": BenchmarkSpec("spatial_agent.evals.refspatialbench", "RefSpatialBench", "RefSpatial-Bench"),
     "robospatialhome": BenchmarkSpec("spatial_agent.evals.robospatialhome", "RoboSpatialHome", "RoboSpatial-Home"),
     "where2place": BenchmarkSpec("spatial_agent.evals.where2place", "Where2Place", "Where2Place"),
+    # ReVSI, 32-frame configuration (video; numeric MRA + MCQ)
+    "revsi": BenchmarkSpec("spatial_agent.evals.revsi", "ReVSI", "ReVSI"),
     # --- Sentinel ---
     "none": BenchmarkSpec(None, None),
 }
