@@ -131,7 +131,6 @@ def _normalize_text(text: str) -> str:
 # For these, use normalized exact-match instead of extract_answer.
 _EXACT_MATCH_BENCHMARKS = {"dsr-bench"}
 
-# Benchmarks using tolerance-based numeric evaluation (not MC or exact-match).
 # SpatialTree metrics that can be scored without external tools (LLM judge, etc.)
 _SPATIALTREE_SCOREABLE_METRICS = {"multichoiceeval", "meanrelativeacc", "judge"}
 
@@ -232,7 +231,7 @@ def _extract_display(content: str, ground_truth: str, benchmark: str = "") -> tu
 
     Returns (extracted_pred, extracted_gt).
     """
-    if benchmark in _EXACT_MATCH_BENCHMARKS or benchmark in _TOLERANCE_BENCHMARKS or benchmark == "spatialtree":
+    if benchmark in _EXACT_MATCH_BENCHMARKS or benchmark == "spatialtree":
         # Show raw text for non-MC benchmarks
         pred = content.strip() if content else ""
         gt = ground_truth.strip() if ground_truth else ""
