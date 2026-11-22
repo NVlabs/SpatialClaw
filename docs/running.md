@@ -171,6 +171,54 @@ python -m spatial_agent.entrypoints.cot_baseline \
     --model   spatial_agent/config/model/qwen3.5-397b-a17b.json
 ```
 
+### Cosmos3-Super v4 paired evaluation
+
+The completed comparison uses one backbone in two modes, no-tool CoT and SpatialClaw v4. The panel lists the original 200 sample IDs in order for each of 20 benchmarks. Use the full benchmark datasets under `data/` in their original row order. ViewSpatial, PAI-Bench and DSI-Bench derive IDs from source positions. The source revisions come from the original Hugging Face download metadata. Extracted media were not individually checksummed in the original run. See the [ordered panel](../spatial_agent/config/panels/cosmos-v4-200.json) and [dataset revisions](../spatial_agent/config/panels/cosmos-v4-data.tsv).
+
+For a fresh data checkout, authenticate with Hugging Face and download the pinned revisions before running the repository's archive extraction step. Existing users with the same prepared datasets can skip this step.
+
+```bash
+set -e
+while read -r repo folder revision; do
+  hf download --repo-type dataset --revision "$revision" "$repo" --local-dir "data/$folder"
+done < <(tail -n +2 spatial_agent/config/panels/cosmos-v4-data.tsv)
+bash spatial_agent/scripts/download_datasets.sh "${HF_TOKEN:?provide a Hugging Face read token}"
+```
+
+Run the services from the same checkout on a dedicated node. The reference server used four H100 80 GB GPUs, vLLM 0.27.1, Transformers 5.5.0 and PyTorch 2.13.0+cu129. Start it in the serving environment with four free GPUs available to the launcher. The launcher selects devices through NVML and publishes the endpoint in the checkout's registry.
+
+```bash
+SPATIAL_AGENT_ENABLE_SYNTHETIC_KEEPALIVE=0 python -m spatial_agent.entrypoints.launch_vllm \
+  --model nvidia/Cosmos3-Super --revision f543c56225b2e04d0ad141e29655be3a45d9c455 \
+  --served_model_name cosmos3-super --tp 4 --max_model_len 262144 --max_num_seqs 4
+```
+
+The agent also used SAM3.1 and DA3 on a fifth GPU. For the SAM3.1 download above, use `facebook/sam3.1` revision `daa63191845a41281374e725f4c9e51c7a824460` and the `sam3.1_multiplex.pt` weights. Export `SPATIAL_AGENT_DA3_MODEL_ID` as the local snapshot directory for `depth-anything/DA3NESTED-GIANT-LARGE-1.1` revision `b2359bdf726fb44ef62acca04d629dcf158053e7`. In the tool environment, start this service with only the fifth GPU visible (device 4 in this example).
+
+```bash
+CUDA_VISIBLE_DEVICES=4 SPATIAL_AGENT_ENABLE_SYNTHETIC_KEEPALIVE=0 \
+  python -m spatial_agent.entrypoints.launch_gpu_server --num_gpus 1 --reconstruct_backend da3
+```
+
+After both services are ready, run the following in Bash from the repository root in the evaluation environment. Its Conda history records FFmpeg 8.0.1 (conda-forge build `gpl_h43fde53_912`) for frame extraction. Use a fresh output directory for the first run. Keep the `vllm` selector so the native client sends the profile's role-specific sampling and thinking settings.
+
+```bash
+set -e
+panel=spatial_agent/config/panels/cosmos-v4-200.json
+model=spatial_agent/config/model/cosmos3-super.json
+results=spatial_agent/work_dir/cosmos-super-v4-200
+for benchmark in $(python -c 'import json, sys; print(*json.load(open(sys.argv[1])))' "$panel"); do
+  common=(--model "$model" --dataset "spatial_agent/config/dataset/$benchmark.json"
+          --llm_base_url vllm --sample_panel "$panel" --seed 0 --concurrency 2)
+  python -m spatial_agent.entrypoints.cot_baseline "${common[@]}" \
+    --system_prompt cot --frame-preparation spatial-agent --work_dir "$results/$benchmark/cot"
+  python -m spatial_agent.entrypoints.run "${common[@]}" --work_dir "$results/$benchmark/agent"
+done
+python spatial_agent/scripts/score_cosmos_panel.py --panel "$panel" --results "$results"
+```
+
+The scorer checks that each pair received the same visual inputs, pairs native per-item scores by ID, retains fractional scores, and gives each benchmark equal weight. On the reference data, 62 SpatialTree pairs had undefined native scores in both arms, leaving 3,938 numeric pairs across the 20 benchmarks. The reported 95% interval resamples paired items within each benchmark with the benchmark set fixed. This scoring convention allows a sampled panel to include incomplete groups such as Video-MME v2 question groups. Sampled model outputs can vary with serving software, hardware and batching even with the recorded seed.
+
 ---
 
 > Next: [Monitoring & logs »](monitoring.md) &nbsp;·&nbsp; Hitting errors? See [Troubleshooting](troubleshooting.md)

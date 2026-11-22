@@ -1,14 +1,19 @@
 """Base benchmark and sample classes."""
 
+import errno
+import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -275,6 +280,117 @@ def _probe_video_meta(ffmpeg: str, video_path: str):
     return fps, total, duration
 
 
+_FRAME_CACHE_LOCK_TIMEOUT = 600
+
+
+@contextmanager
+def _locked_frame_cache(cache_dir: str, video_path: str):
+    """Lock a writable cache and own one private extraction directory."""
+    fallback = fallback_video_frame_cache_dir(video_path)
+    for candidate in dict.fromkeys((cache_dir, fallback)):
+        lock_file = None
+        staging_dir = None
+        try:
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                # Keep this file permanently: replacing it would split the lock.
+                lock_file = open(os.path.join(candidate, ".lock"), "a")
+                deadline = time.monotonic() + _FRAME_CACHE_LOCK_TIMEOUT
+                while True:
+                    try:
+                        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError as exc:
+                        if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(f"Timed out waiting for frame cache: {candidate}")
+                        time.sleep(min(0.05, remaining))
+                # Also detects an existing cache with an unwritable directory.
+                staging_dir = tempfile.mkdtemp(prefix=".staging-", dir=candidate)
+            except OSError as exc:
+                if candidate != fallback and exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                    continue
+                raise
+            yield candidate, staging_dir
+            return
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            if lock_file is not None:
+                lock_file.close()
+
+
+def _frame_cache_identity(video_path, video_max_fps, video_frame_resize_short_edge):
+    source = os.stat(video_path)
+    return {
+        "version": 1,
+        "source": os.path.realpath(video_path),
+        "size": source.st_size,
+        "mtime_ns": source.st_mtime_ns,
+        "ctime_ns": source.st_ctime_ns,
+        "video_max_fps": video_max_fps,
+        "video_frame_resize_short_edge": video_frame_resize_short_edge,
+    }
+
+
+def _frame_file_stat(path):
+    stat = os.stat(path)
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "ctime_ns": stat.st_ctime_ns}
+
+
+def _validate_frame_images(frame_paths):
+    from PIL import Image
+
+    for path in frame_paths:
+        with Image.open(path) as image:
+            image.load()
+
+
+def _read_frame_cache(cache_dir, identity):
+    """Read complete metadata; malformed, stale, or damaged caches are misses."""
+    try:
+        with open(os.path.join(cache_dir, "meta.json")) as file:
+            meta = json.load(file)
+        if not isinstance(meta, dict):
+            return None
+        if "cache_identity" in meta and meta["cache_identity"] != identity:
+            return None
+        files = meta["frame_files"]
+        indices = meta["frame_indices"]
+        fps = meta["fps"]
+        if not isinstance(files, list) or not files or not all(isinstance(name, str) for name in files):
+            return None
+        if not isinstance(indices, list) or len(indices) != len(files):
+            return None
+        if any(type(index) is not int or index < 0 for index in indices):
+            return None
+        if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
+            return None
+        total = meta.get("total_video_frames", len(files))
+        if type(total) is not int or total < 0:
+            return None
+        frame_paths = [os.path.join(cache_dir, name) for name in files]
+        cache_root = os.path.realpath(cache_dir)
+        if any(os.path.isabs(name) for name in files) or any(
+            os.path.commonpath((cache_root, os.path.realpath(path))) != cache_root
+            for path in frame_paths
+        ):
+            return None
+        if "cache_identity" in meta:
+            # These immutable files were decoded before publication. Stat checks
+            # detect later damage without decoding a whole video on every hit.
+            if meta.get("frame_stats") != [_frame_file_stat(path) for path in frame_paths]:
+                return None
+        else:
+            # Legacy metadata has neither settings identity nor a verified manifest.
+            _validate_frame_images(frame_paths)
+        return frame_paths, indices, fps, total
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
 def extract_video_frames(
     video_path: str,
     cache_dir: str,
@@ -285,7 +401,8 @@ def extract_video_frames(
 
     Handles H.264, HEVC, AV1, VP9, and all other codecs supported by ffmpeg.
     Uses imageio_ffmpeg as fallback when system ffmpeg is not on PATH.
-    Results are cached to disk; empty results are never cached.
+    Results are cached in immutable generations, published atomically under a
+    per-cache lock. Empty or failed extractions are never published.
 
     Args:
         video_path: Path to the video file.
@@ -300,74 +417,75 @@ def extract_video_frames(
         print(f"[Warning] Video not found: {video_path}")
         return [], [], 0.0, 0
 
-    # Check cache
-    meta_path = os.path.join(cache_dir, "meta.json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-        # Only use cache if it has frames (don't trust empty caches from
-        # earlier cv2-based extraction that failed on AV1/VP9 codecs)
-        if meta["frame_files"]:
-            frame_paths = [os.path.join(cache_dir, fn) for fn in meta["frame_files"]]
-            if all(os.path.exists(p) for p in frame_paths):
-                return (
-                    frame_paths, meta["frame_indices"],
-                    meta["fps"], meta.get("total_video_frames", len(frame_paths)),
-                )
+    # Published files are immutable, so hits need no writable lock or directory.
+    # Recheck under the lock after a miss, since another producer may finish first.
+    identity = _frame_cache_identity(video_path, video_max_fps, video_frame_resize_short_edge)
+    cached = _read_frame_cache(cache_dir, identity)
+    if cached is not None:
+        return cached
 
-    try:
-        os.makedirs(cache_dir, exist_ok=True)
-    except OSError:
-        cache_dir = fallback_video_frame_cache_dir(video_path)
-        os.makedirs(cache_dir, exist_ok=True)
-        meta_path = os.path.join(cache_dir, "meta.json")
+    with _locked_frame_cache(cache_dir, video_path) as (cache_dir, staging_dir):
+        identity = _frame_cache_identity(video_path, video_max_fps, video_frame_resize_short_edge)
+        cached = _read_frame_cache(cache_dir, identity)
+        if cached is not None:
+            return cached
 
-    ffmpeg = _find_ffmpeg()
-    fps, total, duration = _probe_video_meta(ffmpeg, video_path)
+        ffmpeg = _find_ffmpeg()
+        fps, total, duration = _probe_video_meta(ffmpeg, video_path)
 
-    # Determine output fps
-    if video_max_fps and fps > video_max_fps:
-        out_fps = video_max_fps
-    else:
-        out_fps = fps
+        # Preserve the extraction filters, JPEG quality, and frame-index mapping.
+        if video_max_fps and fps > video_max_fps:
+            out_fps = video_max_fps
+        else:
+            out_fps = fps
+        vf_filters = [f"fps={out_fps}"]
+        if video_frame_resize_short_edge:
+            se = video_frame_resize_short_edge
+            vf_filters.append(
+                f"scale='if(lte(iw,ih),{se},-2)':'if(lte(iw,ih),-2,{se})'"
+            )
+        cmd = [
+            ffmpeg, "-v", "error",
+            "-i", video_path,
+            "-vf", ",".join(vf_filters),
+            "-q:v", "2",
+            os.path.join(staging_dir, "frame_%06d.jpg"),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result.check_returncode()
 
-    # Extract frames via ffmpeg
-    vf_filters = [f"fps={out_fps}"]
-    if video_frame_resize_short_edge:
-        se = video_frame_resize_short_edge
-        vf_filters.append(
-            f"scale='if(lte(iw,ih),{se},-2)':'if(lte(iw,ih),-2,{se})'"
+        frame_files = sorted(
+            name for name in os.listdir(staging_dir)
+            if name.startswith("frame_") and name.endswith(".jpg")
         )
-    cmd = [
-        ffmpeg, "-v", "error",
-        "-i", video_path,
-        "-vf", ",".join(vf_filters),
-        "-q:v", "2",
-        os.path.join(cache_dir, "frame_%06d.jpg"),
-    ]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        frame_paths = [os.path.join(staging_dir, name) for name in frame_files]
+        step = fps / out_fps
+        frame_indices = [int(round(i * step)) for i in range(len(frame_files))]
+        if not frame_paths:
+            print(f"[Warning] No frames extracted from {video_path}")
+            return [], [], fps, total
 
-    # Collect results
-    frame_files = sorted(
-        f for f in os.listdir(cache_dir) if f.startswith("frame_") and f.endswith(".jpg")
-    )
-    frame_paths = [os.path.join(cache_dir, fn) for fn in frame_files]
+        _validate_frame_images(frame_paths)
+        if identity != _frame_cache_identity(video_path, video_max_fps, video_frame_resize_short_edge):
+            raise RuntimeError(f"Video changed during frame extraction: {video_path}")
+        generation_name = os.path.basename(staging_dir).replace(".staging-", ".generation-", 1)
+        generation_dir = os.path.join(cache_dir, generation_name)
+        meta = {
+            "frame_indices": frame_indices,
+            "frame_files": [os.path.join(generation_name, name) for name in frame_files],
+            "fps": fps,
+            "total_video_frames": total,
+            "cache_identity": identity,
+            "frame_stats": [_frame_file_stat(path) for path in frame_paths],
+        }
+        with open(os.path.join(staging_dir, "meta.json"), "w") as file:
+            json.dump(meta, file)
+            file.flush()
+            os.fsync(file.fileno())
 
-    # Compute original frame indices from output fps
-    step = fps / out_fps
-    frame_indices = [int(round(i * step)) for i in range(len(frame_files))]
-
-    if not frame_paths:
-        print(f"[Warning] No frames extracted from {video_path}")
-        return [], [], fps, total
-
-    meta = {
-        "frame_indices": frame_indices,
-        "frame_files": [os.path.basename(p) for p in frame_paths],
-        "fps": fps,
-        "total_video_frames": total,
-    }
-    with open(meta_path, "w") as f:
-        json.dump(meta, f)
-
-    return frame_paths, frame_indices, fps, total
+        # Never rewrite/remove an older generation: callers may still be using it.
+        os.rename(staging_dir, generation_dir)
+        # Keep this generation even if publication raises: the rename may have
+        # committed before an interrupt or filesystem error reaches this process.
+        os.replace(os.path.join(generation_dir, "meta.json"), os.path.join(cache_dir, "meta.json"))
+        return [os.path.join(cache_dir, name) for name in meta["frame_files"]], frame_indices, fps, total

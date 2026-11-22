@@ -20,6 +20,12 @@ from typing import Any, Dict, List, Optional
 from PIL import Image
 from tqdm.asyncio import tqdm
 
+from spatial_agent.evals.panel import (
+    load_sample_panel,
+    require_empty_panel_work_dir,
+    select_panel_samples,
+)
+
 
 # ── prompt ──────────────────────────────────────────────────────────────────
 
@@ -526,6 +532,9 @@ def parse_args():
         help="Set the generation seed for paired repeat runs.",
     )
     parser.add_argument("--sample_ids", nargs="+", default=None)
+    parser.add_argument("--sample_panel", metavar="PATH",
+                        help="JSON mapping benchmarks to ordered sample IDs. "
+                             "Uses native per-sample scores and skips benchmark aggregates.")
     parser.add_argument("--shuffle", action="store_true",
                         help="Shuffle samples before applying --limit (for random sampling)")
     parser.add_argument("--subsample", type=int, default=None, metavar="N",
@@ -560,6 +569,11 @@ async def main():
     # Override defaults for CoT baseline (no tools, no kernel)
     config.tools_to_use = []
     config.validate()
+    panel_ids = None
+    if args.sample_panel is not None:
+        panel_ids = load_sample_panel(
+            args.sample_panel, config, subsample=args.subsample, shuffle=args.shuffle,
+        )
 
     # Default concurrency is higher for CoT (no GPU tools needed)
     if config.concurrency == 1 and args.concurrency is None:
@@ -577,12 +591,14 @@ async def main():
             _pkg_dir, "work_dir", f"cot_{config.benchmark}_{model_variant}"
         )
     os.makedirs(config.work_dir, exist_ok=True)
+    if panel_ids is not None and not args.resume:
+        require_empty_panel_work_dir(config.work_dir)
     preflight_predictions = os.path.join(config.work_dir, "predictions.jsonl")
     preflight_identity_enforced = bool(
         config.record_input_fingerprints
         or os.environ.get("SPATIAL_AGENT_SEALED_GIT_HEAD")
     )
-    if not (
+    if panel_ids is None and not (
         args.resume
         and preflight_identity_enforced
         and os.path.isfile(preflight_predictions)
@@ -610,7 +626,9 @@ async def main():
         args.shuffle = True
         config.limit = args.subsample
 
-    if config.sample_ids:
+    if panel_ids is not None:
+        benchmark.data = select_panel_samples(benchmark.data, panel_ids)
+    elif config.sample_ids:
         id_set = set(config.sample_ids)
         benchmark.data = [
             s for s in benchmark.data
@@ -640,7 +658,7 @@ async def main():
     )
     sealed_git_head = _sealed_git_head_from_environment()
     provenance_enabled = bool(
-        record_input_fingerprints or sealed_git_head is not None
+        panel_ids is not None or record_input_fingerprints or sealed_git_head is not None
     )
     run_manifest = None
     if provenance_enabled:
@@ -690,6 +708,8 @@ async def main():
             "sealed_git_head": sealed_git_head,
             "source_tree_sha256": _source_tree_sha256(package_dir),
         }
+        if panel_ids is not None:
+            run_manifest["per_item_panel"] = True
 
     pred_file = os.path.join(config.work_dir, "predictions.jsonl")
     input_manifest_file = os.path.join(config.work_dir, "input_manifest.jsonl")
@@ -786,17 +806,17 @@ async def main():
         print("All samples already completed.")
 
     # ── evaluate ────────────────────────────────────────────────────────
-    all_preds: Dict[str, str] = {}
-    if os.path.exists(pred_file):
-        with open(pred_file) as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    all_preds[entry["sample_id"]] = entry.get("extracted", _extract_boxed(entry["content"]))
-                except Exception:
-                    pass
-
-    results = benchmark.evaluate(all_preds, output_dir=config.work_dir)
+    if panel_ids is None:
+        all_preds: Dict[str, str] = {}
+        if os.path.exists(pred_file):
+            with open(pred_file) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        all_preds[entry["sample_id"]] = entry.get("extracted", _extract_boxed(entry["content"]))
+                    except Exception:
+                        pass
+        benchmark.evaluate(all_preds, output_dir=config.work_dir)
 
     print(f"\nResults saved to: {config.work_dir}")
 

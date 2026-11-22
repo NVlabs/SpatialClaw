@@ -22,6 +22,12 @@ from typing import Any, Dict
 
 from tqdm.asyncio import tqdm
 
+from spatial_agent.evals.panel import (
+    load_sample_panel,
+    require_empty_panel_work_dir,
+    select_panel_samples,
+)
+
 
 def _sha256_file(path: str | None) -> str | None:
     """Hash a configuration artifact when it exists."""
@@ -172,6 +178,9 @@ def parse_args():
     parser.add_argument("--llm_base_url", type=str, default=None)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--sample_ids", nargs="+", default=None)
+    parser.add_argument("--sample_panel", metavar="PATH",
+                        help="JSON mapping benchmarks to ordered sample IDs. "
+                             "Uses native per-sample scores and skips benchmark aggregates.")
     parser.add_argument("--executor_type", type=str, default=None,
                         choices=["code", "react", "single_pass"],
                         help="Executor variant: code (default, free-form Python), "
@@ -527,6 +536,11 @@ async def main():
         ):
             getattr(config, role_attr).seed = args.seed
     config.validate()
+    panel_ids = None
+    if args.sample_panel is not None:
+        panel_ids = load_sample_panel(
+            args.sample_panel, config, subsample=args.subsample, shuffle=args.shuffle,
+        )
 
     # Default work_dir lives next to the spatial_agent package, not cwd.
     # A named model profile gets an isolated directory so the new Cosmos
@@ -538,12 +552,14 @@ async def main():
         dir_name = f"spatial_{config.benchmark}_{model_variant}"
         config.work_dir = os.path.join(_pkg_dir, "work_dir", dir_name)
     os.makedirs(config.work_dir, exist_ok=True)
+    if panel_ids is not None and not args.resume:
+        require_empty_panel_work_dir(config.work_dir)
     preflight_predictions = os.path.join(config.work_dir, "predictions.jsonl")
     preflight_identity_enforced = bool(
         config.record_input_fingerprints
         or os.environ.get("SPATIAL_AGENT_SEALED_GIT_HEAD")
     )
-    if not (
+    if panel_ids is None and not (
         args.resume
         and preflight_identity_enforced
         and os.path.isfile(preflight_predictions)
@@ -568,7 +584,9 @@ async def main():
         args.shuffle = True
         config.limit = args.subsample
 
-    if config.sample_ids:
+    if panel_ids is not None:
+        benchmark.data = select_panel_samples(benchmark.data, panel_ids)
+    elif config.sample_ids:
         id_set = set(config.sample_ids)
         benchmark.data = [s for s in benchmark.data if str(s.sample_id) in id_set]
     else:
@@ -581,7 +599,7 @@ async def main():
 
     sealed_git_head = _sealed_git_head_from_environment()
     provenance_enabled = bool(
-        config.record_input_fingerprints or sealed_git_head is not None
+        panel_ids is not None or config.record_input_fingerprints or sealed_git_head is not None
     )
     run_manifest = None
     if provenance_enabled:
@@ -617,6 +635,8 @@ async def main():
             "sealed_git_head": sealed_git_head,
             "source_tree_sha256": _source_tree_sha256(package_dir),
         }
+        if panel_ids is not None:
+            run_manifest["per_item_panel"] = True
 
     pred_file = os.path.join(config.work_dir, "predictions.jsonl")
     input_manifest_file = os.path.join(config.work_dir, "input_manifest.jsonl")
@@ -678,17 +698,19 @@ async def main():
     else:
         print("All samples already completed.")
 
-    all_preds = {}
-    if os.path.exists(pred_file):
-        with open(pred_file) as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    all_preds[entry["sample_id"]] = entry["content"]
-                except Exception:
-                    pass
-
-    results = benchmark.evaluate(all_preds, output_dir=config.work_dir)
+    # Subsets can cut across official scoring groups (e.g. Video-MME v2).
+    # The worker already records the native per-item score for each answer.
+    if panel_ids is None:
+        all_preds = {}
+        if os.path.exists(pred_file):
+            with open(pred_file) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line.strip())
+                        all_preds[entry["sample_id"]] = entry["content"]
+                    except Exception:
+                        pass
+        benchmark.evaluate(all_preds, output_dir=config.work_dir)
 
     workflow.shutdown()
 
